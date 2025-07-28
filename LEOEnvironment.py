@@ -325,7 +325,13 @@ class Cell:
 
 # Earth consisting of cells
 class Earth:
-    def __init__(self, env, constellation, inputParams, deltaT, getRates = False, window=None):
+    def __init__(self, env, img_path, constellation, inputParams, deltaT, getRates = False, window=None):
+        pop_count_data = Image.open(img_path)
+        # total image sizes
+        [self.total_x, self.total_y] = pop_count_data.size
+
+        self.total_cells = self.total_x * self.total_y
+
         # window is a list with the coordinate bounds of our window of interest
         # format for window = [western longitude, eastern longitude, southern latitude, northern latitude]
         if window is not None:  # if window provided
@@ -359,7 +365,7 @@ class Earth:
         self.windowy = ((int)((0.5 - window[3] / 180) * self.total_y), (int)((0.5 - window[2] / 180) * self.total_y))
 
 
-    def moveConstellation(self, env, deltaT=3600, getRates = False):
+    def moveConstellation(self, env, deltaT=10, getRates = False):
         """
         Simpy process function:
 
@@ -372,11 +378,14 @@ class Earth:
         processes managing the send-buffers are checked to ensure they will still work correctly.
         """
         while True:
+    
             # rotate constellation and satellites
             for constellation in self.LEO:
                 constellation.rotate(deltaT)
+            yield env.timeout(deltaT)    
 
     def plotMap(self, plotSat = True, path = None, bottleneck = None):
+        print("Plotting map")
         plt.figure()
 
         colors = matplotlib.cm.rainbow(np.linspace(0, 1, len(self.LEO)))
@@ -397,7 +406,7 @@ class Earth:
 
         plt.xticks([])
         plt.yticks([])
-        plt.imshow(np.log10(np.array(self.getCellUsers()).transpose() + 1), )
+        #plt.imshow(np.log10(np.array(self.getCellUsers()).transpose() + 1), )
         # plt.title('LEO constellation and Ground Terminals')
         # plt.rcParams['figure.figsize'] = 36, 12  # adjust if figure is too big or small for screen
         # plt.colorbar(fraction=0.1)  # adjust fraction to change size of color bar
@@ -418,6 +427,16 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
+    def save_plot_at_intervals(self, env, interval=1):
+        img_count = 0
+        while True:
+            print(f"Saving plot {img_count} at simulation time {env.now}")
+            self.plotMap(plotSat=True)
+            plt.savefig(f"simulationImages/sat_positions_{img_count}.png")
+            plt.close()
+            img_count += 1
+            yield env.timeout(interval)        
+
     def __repr__(self):
         return 'total divisions in x = {}\n total divisions in y = {}\n total cells = {}\n window of operation ' \
                '(longitudes) = {}\n window of operation (latitudes) = {}'.format(
@@ -433,7 +452,7 @@ class Earth:
 ###############################################################################
 
 
-def initialize(env, inputParams, movementTime):
+def initialize(env, img_path, inputParams, movementTime):
     """
     Initializes an instance of the earth with cells from a population map and gateways from a csv file.
     During initialisation, several steps are performed to prepare for simulation:
@@ -449,8 +468,9 @@ def initialize(env, inputParams, movementTime):
     constellationType = inputParams['Constellation'][0]
 
     # Load earth and gateways
-    earth = Earth(env,  constellationType, inputParams, movementTime)
+    earth = Earth(env, img_path,  constellationType, inputParams, movementTime)
 
+    print("Initialized Earth")
     print(earth)
     print()
 
@@ -542,73 +562,6 @@ def create_Constellation(specific_constellation, env):
 
     return orbital_planes
 
-###############################################################################
-###############################  Create Graph   ###############################
-###############################################################################
-
-
-def get_direction(Satellites):
-    '''
-    Gets the direction of the satellites so each transceiver antenna can be set to one direction.
-    '''
-    N = len(Satellites)
-    direction = np.zeros((N,N), dtype=np.int8) 
-    for i in range(N):
-        epsilon = -Satellites[i].inclination    # orbital plane inclination
-        for j in range(N):
-            direction[i,j] = np.sign(Satellites[i].y*math.sin(epsilon)+ 
-                                    Satellites[i].z*math.cos(epsilon)-Satellites[j].y*math.sin(epsilon)- 
-                                    Satellites[j].z*math.cos(epsilon))
-    return direction
-
-
-def get_pos_vectors_omni(Satellites):
-    '''
-    Given a list of satellites returns a list with x, y, z coordinates and the plane where they are (meta)
-    '''
-    N = len(Satellites)
-    Positions = np.zeros((N,3))
-    meta = np.zeros(N, dtype=np.int_)
-    for n in range(N):
-        #Satellites[n].rotate_axes([1,0,0],-Orbital_planes[1].inclination)
-        Positions[n,:] = [Satellites[n].x, Satellites[n].y, Satellites[n].z]
-        meta[n] = Satellites[n].in_plane
-    
-    return Positions, meta
-
-
-def get_slant_range(edge):
-        return(edge.slant_range)
-
-
-@numba.jit  # Using this decorator you can mark a function for optimization by Numba's JIT compiler
-def get_slant_range_optimized(Positions, N):
-    '''
-    returns a matrix with the all the distances between the satellites (optimized)
-    '''
-    slant_range = np.zeros((N,N))
-    for i in range(N):
-        slant_range[i,i] = math.inf
-        for j in range(i+1,N):
-            slant_range[i,j] = np.linalg.norm(Positions[i,:] - Positions[j,:])
-    slant_range += np.transpose(slant_range)
-    return slant_range
-
-
-@numba.jit  # Using this decorator you can mark a function for optimization by Numba's JIT compiler
-def los_slant_range(_slant_range, _meta, _max, _Positions):
-    ''' 
-    line of sight slant range
-    '''
-    _slant_range_new = np.copy(_slant_range)
-    _N = len(_slant_range)
-    for i in range(_N):
-        for j in range(_N):
-            if _slant_range_new[i,j] > _max[_meta[i], _meta[j]]:
-                _slant_range_new[i,j] = math.inf
-    return _slant_range_new
-
-
 
 def main():
     """
@@ -619,25 +572,31 @@ def main():
     inputParams = pd.read_csv("input.csv")
 
 
-    testLength = inputParams['Test length'][0]
+    #testLength = inputParams['Test length'][0]
+    testLength = 60
 
     # movement time should be in the order of 10's of hours when the test type is "Rates".
     # If the test is not 'Rates', the movement time is still kept large to avoid the constellation moving
-    movementTime = 10 * 3600
+    movementTime = 1
+    print(f"movement time: {movementTime}")
+    #10 * 3600
 
     simulationTimelimit = testLength
 
-    env = simpy.Environment()
+    print(f"simulation test limit: {simulationTimelimit}")
 
-    earth1= initialize(env,
-                        'Population Map/gpw_v4_population_count_rev11_2020_15_min.tif',
-                        'Gateways.csv', 500, inputParams, movementTime, locations)
+    env = simpy.Environment()
+    img_path = "PopMap_500.png"
+
+    earth1= initialize(env, img_path, inputParams, movementTime)
+
+    # Start plotting process every 10 seconds
+    env.process(earth1.save_plot_at_intervals(env, interval=1))
 
     progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
     env.run(simulationTimelimit)
     timeToSim = time.time() - startTime
-
 
 if __name__ == '__main__':
     main()
