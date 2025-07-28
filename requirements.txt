@@ -1,0 +1,5 @@
+gymnasium
+geopy
+simpy
+matplotlib
+numba
