@@ -3,3 +3,4 @@ geopy
 simpy
 matplotlib
 numba
+cartopy
