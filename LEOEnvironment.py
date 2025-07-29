@@ -583,7 +583,7 @@ def main():
 
 
     #testLength = inputParams['Test length'][0]
-    testLength = 60
+    testLength = 60*3
 
     # movement time should be in the order of 10's of hours when the test type is "Rates".
     # If the test is not 'Rates', the movement time is still kept large to avoid the constellation moving
