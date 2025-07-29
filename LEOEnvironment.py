@@ -391,7 +391,7 @@ class Earth:
 
     def plotMap(self, plotSat = True, path = None, bottleneck = None):
         print("Plotting map")
-        plt.figure()
+        #plt.figure()
         fig = plt.figure(figsize=(12, 6))
         ax = plt.axes(projection=ccrs.PlateCarree())
         ax.coastlines()
@@ -407,7 +407,7 @@ class Earth:
                     gridSatX = int((0.5 + math.degrees(sat.longitude) / 360) * 1440)
                     gridSatY = int((0.5 - math.degrees(sat.latitude) / 180) * 720) #GT.totalY)
                     #scat2 = plt.scatter(gridSatX, gridSatY, marker='o', s=18, linewidth=0.5, color=c, label = sat.ID)
-                    ax.scatter(gridSatX, gridSatY, color=c, s=18, transform=ccrs.PlateCarree())
+                    ax.scatter(math.degrees(sat.longitude), math.degrees(sat.latitude), color=c, s=18, transform=ccrs.PlateCarree())
                     # print('Longitude: ' + str(math.degrees(sat.longitude)) +  ', Grid X: ' + str(gridSatX) + '\nLatitude: ' + str(math.degrees(sat.latitude)) + ', Grid Y: ' + str(gridSatY))
                         # Longitude +-180º, latitude +-90º
         
@@ -420,7 +420,7 @@ class Earth:
         # plt.title('LEO constellation and Ground Terminals')
         # plt.rcParams['figure.figsize'] = 36, 12  # adjust if figure is too big or small for screen
         # plt.colorbar(fraction=0.1)  # adjust fraction to change size of color bar
-        plt.show()
+        #plt.show()
 
     def plot3D(self):
         fig = plt.figure()
