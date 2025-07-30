@@ -19,6 +19,8 @@ import matplotlib.patches as mpatches
 from shapely.geometry import box
 from shapely.geometry import Polygon
 from shapely.affinity import scale, rotate, translate
+from scipy.spatial import KDTree
+import numpy as np
 
 
 ###############################################################################
@@ -463,10 +465,125 @@ class Aircraft:
         self.altitude = altitude  # in meters
         self.Gr = 5 #dBi - Gain of the aircraft antenna
         self.env = env  # Simpy environment
+        self.satellite = None
+        self.beam = None 
 
     def __repr__(self):
         return 'Aircraft ID: {}, Latitude: {}, Longitude: {}, Altitude: {}'.format(
             self.ID, self.latitude, self.longitude, self.altitude)
+
+    def calculate_snr(self, beam, distance_km):
+        # Constants
+        c = 3e8  # speed of light (m/s)
+        k = 1.38e-23  # Boltzmann's constant
+        T = 290  # Noise temperature (K)
+        
+        # Beam parameters (assumed to be in dBm, dBi, Hz, etc.)
+        Pt_dBm = beam.Pt  # Transmit power in dBm
+        Gt_dBi = beam.Gt  # Transmit antenna gain in dBi
+        Gr_dBi = self.Gr  # Aircraft receive antenna gain in dBi
+        f_Hz = beam.frequency * 1e9  # Frequency in Hz (beam.frequency in GHz)
+        B_Hz = beam.bw  # Bandwidth in Hz
+
+        # Convert dBm to dBW
+        Pt_dBW = Pt_dBm - 30
+
+        # Free-space path loss (FSPL) in dB
+        d_m = distance_km * 1000
+        FSPL_dB = 20 * math.log10(d_m) + 20 * math.log10(f_Hz) - 147.55
+
+        # Received power in dBW
+        Pr_dBW = Pt_dBW + Gt_dBi + Gr_dBi - FSPL_dB
+
+        # Noise power in dBW
+        N_dBW = 10 * math.log10(k * T * B_Hz)
+
+        # SNR in dB
+        SNR_dB = Pr_dBW - N_dBW
+        return SNR_dB
+
+    def scan_nearby_fast(self, earth, threshold_km=500):
+        # Gather all beam centers and references
+        beam_coords = []
+        beam_refs = []
+        for plane in earth.LEO:
+            for sat in plane.sats:
+                for beam in sat.beams:
+                    beam_coords.append([beam.center_lat, beam.center_lon])
+                    beam_refs.append((sat, beam))
+        beam_coords = np.array(beam_coords)
+
+        # Build KDTree
+        tree = KDTree(beam_coords)
+
+        # Query for all beams within threshold (in degrees, approx)
+        threshold_deg = threshold_km / 111.0
+        idxs = tree.query_ball_point([self.latitude, self.longitude], r=threshold_deg)
+
+        results = []
+        best_snr = -np.inf
+        best_sat = None
+        best_beam = None
+
+        for idx in idxs:
+            sat, beam = beam_refs[idx]
+            beam_dist = geopy.distance.distance(
+                (self.latitude, self.longitude),
+                (beam.center_lat, beam.center_lon)
+            ).km
+            if beam_dist < threshold_km:
+                snr = self.calculate_snr(beam, beam_dist)
+                results.append({
+                    'type': 'beam',
+                    'sat_id': sat.ID,
+                    'beam_id': beam.id,
+                    'distance_km': beam_dist,
+                    'snr_db': snr
+                })
+                if snr > best_snr:
+                    best_snr = snr
+                    best_sat = sat
+                    best_beam = beam
+
+        # Set the best satellite and beam
+        self.satellite = best_sat
+        self.beam = best_beam
+
+        return results
+    def scan_nearby(self, earth, threshold_km=500):
+        results = []
+        for plane in earth.LEO:
+            for sat in plane.sats:
+                sat_dist = geopy.distance.distance(
+                    (self.latitude, self.longitude),
+                    (math.degrees(sat.latitude), math.degrees(sat.longitude))
+                ).km
+                if sat_dist < threshold_km:
+                    results.append({'type': 'satellite', 'id': sat.ID, 'distance_km': sat_dist})
+                for beam in sat.beams:
+                    beam_dist = geopy.distance.distance(
+                        (self.latitude, self.longitude),
+                        (beam.center_lat, beam.center_lon)
+                    ).km
+                    if beam_dist < threshold_km:
+                        snr = self.calculate_snr(beam, beam_dist)
+                        results.append({
+                            'type': 'beam',
+                            'sat_id': sat.ID,
+                            'beam_id': beam.id,
+                            'distance_km': beam_dist,
+                            'snr_db': snr
+                        })
+        return results
+
+    def scan_at_intervals(self, env, earth, interval=10, threshold_km=500):
+        while True:
+            scan_results = self.scan_nearby_fast(earth, threshold_km=threshold_km)
+            print(f"\n[SimTime {env.now}] Aircraft {self.ID} scan:")
+            for result in scan_results:
+                if result['type'] == 'beam':
+                    print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
+            yield env.timeout(interval)
 
 # A single cell on earth
 class Cell:
@@ -675,12 +792,13 @@ def initialize(env, img_path, inputParams, movementTime):
 
     # Load earth and gateways
     earth = Earth(env, img_path,  constellationType, inputParams, movementTime)
+    aircraft = Aircraft("Aircraft1", 37.7749, -122.4194, 10000, env)  # Example aircraft at San Francisco
 
     print("Initialized Earth")
     print(earth)
     print()
 
-    return earth
+    return earth, aircraft 
 
 
 def create_Constellation(specific_constellation, env):
@@ -797,10 +915,13 @@ def main():
     env = simpy.Environment()
     img_path = "PopMap_500.png"
 
-    earth1= initialize(env, img_path, inputParams, movementTime)
+    earth1, aircraft1 = initialize(env, img_path, inputParams, movementTime)
 
     # Start plotting process every 10 seconds
     env.process(earth1.save_plot_at_intervals(env, interval=1))
+
+    # Start aircraft scanning process every 10 seconds (change interval as needed)
+    env.process(aircraft1.scan_at_intervals(env, earth1, interval=10, threshold_km=500))
 
     progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
