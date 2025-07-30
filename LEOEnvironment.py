@@ -24,9 +24,6 @@ from shapely.affinity import scale, rotate, translate
 ###############################################################################
 #################################    Simpy    #################################
 ###############################################################################
-
-receivedDataBlocks = []
-createdBlocks = []
 seed = np.random.seed(1)
 
 upGSLRates = []
@@ -139,15 +136,25 @@ class OrbitalPlane:
 
 class Beam:
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
-                 load=0, capacity=0, snr=0, id=None):
+                 load=0, capacity=0, snr=0, id=None, constellation = 'OneWeb'):
         self.center_lat = center_lat
         self.center_lon = center_lon
         self.width_deg = width_deg
         self.height_deg = height_deg
         self.load = load
-        self.capacity = capacity
         self.snr = snr
         self.id = id  # Optional: unique identifier for the beam
+        
+        if constellation == 'OneWeb': 
+            self.max_capacity = 7.2 #Gbps 
+            self.max_ds_speed = 150 #Mbps 
+            self.max_us_speed = 30 #Mbps 
+            self.max_latency = 70 #Mbps 
+            self.bw = 250e6 #Mhz 
+            self.frequency = 15 #GHz 
+            self.Pt = 40 #dBm - transmit power 
+            self.Gt = 30 #dBi - antenna gain 
+        
         semi_axis_x = self.width_deg / 2.0
         semi_axis_y = self.height_deg / 2.0
 
@@ -448,6 +455,19 @@ class Satellite:
             self.longitude = 0
         self.update_beams()
 
+class Aircraft: 
+    def __init__(self, ID, latitude, longitude, altitude, env):
+        self.ID = ID
+        self.latitude = latitude  # in degrees
+        self.longitude = longitude  # in degrees
+        self.altitude = altitude  # in meters
+        self.Gr = 5 #dBi - Gain of the aircraft antenna
+        self.env = env  # Simpy environment
+
+    def __repr__(self):
+        return 'Aircraft ID: {}, Latitude: {}, Longitude: {}, Altitude: {}'.format(
+            self.ID, self.latitude, self.longitude, self.altitude)
+
 # A single cell on earth
 class Cell:
     def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=200e6, noise_power=1 / (1e11)):
@@ -698,12 +718,16 @@ def create_Constellation(specific_constellation, env):
     elif specific_constellation =="OneWeb":
         print("Using OneWeb constellation design")
         P = 18
-        N = 648	
+        N = 648	# Number of satellites 
         N_p = int(N/P)
         height = 1200e3
         inclination_angle = 86.4
         Walker_star = True
         min_elevation_angle = 30
+        orbital_speed = 27000 #km/h 
+        orbit_duration = 109 #minutes 
+        orbits_per_day = 13 
+
 
     elif specific_constellation =="Starlink":			# Phase 1 550 km altitude orbit shell
         print("Using Starlink constellation design")
