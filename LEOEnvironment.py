@@ -229,10 +229,20 @@ class Satellite:
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
 
-        # Center the grid on the satellite
-        for i in range(n_beams):
-            center_lat = sat_lat + (i - (n_beams - 1) / 2) * beam_height_deg
-            center_lon = sat_lon
+
+        # Center beam
+        self.beams.append(Beam(sat_lat, sat_lon, beam_width_deg, beam_height_deg))
+
+        # Beams on circle
+        n_circle_beams = n_beams - 1
+        radius_deg = beam_height_deg  # Circle radius in degrees
+
+        for i in range(n_circle_beams):
+            angle = 2 * math.pi * i / n_circle_beams
+            dlat = radius_deg * math.cos(angle)
+            dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude distortion
+            center_lat = sat_lat + dlat
+            center_lon = sat_lon + dlon
             self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
 
     def maxSlantRange(self):
@@ -279,15 +289,23 @@ class Satellite:
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
 
-        idx = 0
-        for i in range(n_beams_side):
-            for j in range(n_beams_side):
-                center_lat = sat_lat + (i - 1.5) * beam_height_deg
-                center_lon = sat_lon + (j - 1.5) * beam_width_deg
-                # Update existing beam objects
-                self.beams[idx].center_lat = center_lat
-                self.beams[idx].center_lon = center_lon
-                idx += 1
+        # Center beam
+        self.beams[0].center_lat = sat_lat
+        self.beams[0].center_lon = sat_lon
+
+        # 15 beams around the center in a circle
+        radius_deg = beam_height_deg
+        n_beams = 16
+        n_beams_side = n_beams - 1
+
+        for i in range(0, n_beams_side):
+            angle = 2 * math.pi * i / n_beams_side
+            dlat = radius_deg * math.cos(angle)
+            dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude
+            center_lat = sat_lat + dlat
+            center_lon = sat_lon + dlon
+            self.beams[i].center_lat = center_lat
+            self.beams[i].center_lon = center_lon
 
     def adjustDownRate(self):
 
@@ -472,10 +490,13 @@ class Earth:
                 if plotSat:
                     ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
                 if plotBeams:
+                    sat.beams[len(sat.beams) - 1].center_lon = lon
+                    sat.beams[len(sat.beams) - 1].center_lat = lat
                     for beam in sat.beams:
-                        footprint = beam.get_footprint()
-                        feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
-                        ax.add_feature(feature)
+                        beam_lon = beam.center_lon
+                        beam_lat = beam.center_lat
+                        # Draw a cross at the beam center
+                        ax.plot(beam_lon, beam_lat, marker='x', markersize=2, color='blue')
         
         # if plotSat: 
         #     plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
