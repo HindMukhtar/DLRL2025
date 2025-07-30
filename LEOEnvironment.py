@@ -17,6 +17,9 @@ from shapely.geometry.polygon import Polygon
 from cartopy.feature import ShapelyFeature
 import matplotlib.patches as mpatches
 from shapely.geometry import box
+from shapely.geometry import Polygon
+from shapely.affinity import scale, rotate, translate
+
 
 ###############################################################################
 #################################    Simpy    #################################
@@ -145,6 +148,17 @@ class Beam:
         self.capacity = capacity
         self.snr = snr
         self.id = id  # Optional: unique identifier for the beam
+        semi_axis_x = self.width_deg / 2.0
+        semi_axis_y = self.height_deg / 2.0
+
+        self.semi_major_axis = max(semi_axis_x, semi_axis_y)
+        self.semi_minor_axis = min(semi_axis_x, semi_axis_y)
+        if self.width_deg >= self.height_deg:
+            # Major axis is horizontal (along longitude)
+            self.orientation_angle = 0.0
+        else:
+            # Major axis is vertical (along latitude)
+            self.orientation_angle = 90.0
 
     def get_footprint(self):
         min_lon = self.center_lon - self.width_deg / 2
@@ -152,6 +166,37 @@ class Beam:
         min_lat = self.center_lat - self.height_deg / 2
         max_lat = self.center_lat + self.height_deg / 2
         return box(min_lon, min_lat, max_lon, max_lat)
+    
+    def get_footprint_eclipse(self, num_segments=100):
+        # Create a circle, then scale and rotate it to form an ellipse
+        # This approach is often easier than generating points directly for an ellipse
+        
+        # Start with a unit circle centered at (0,0)
+        circle_points = []
+        for i in range(num_segments):
+            angle = 2 * math.pi * i / num_segments
+            x = math.cos(angle)
+            y = math.sin(angle)
+            circle_points.append((x, y))
+        
+        # Create a Polygon from the circle points
+        ellipse = Polygon(circle_points)
+        
+        # Scale to desired semi-axes (assuming semi_major_axis along x, semi_minor_axis along y initially)
+        # Note: You might need to swap these depending on your desired ellipse orientation
+        ellipse = scale(ellipse, self.semi_major_axis, self.semi_minor_axis, origin=(0,0))
+        
+        # Rotate to the desired orientation
+        ellipse = rotate(ellipse, self.orientation_angle, origin=(0,0))
+        
+        # Translate to the beam's center (lon, lat)
+        # Assuming your lon/lat are in degrees and represent a flat projection for this
+        # If working with spherical coordinates, this will be more complex and require
+        # projecting points onto a 2D plane before forming the ellipse, then projecting back,
+        # or using a library that handles geodesic ellipses.
+        ellipse = translate(ellipse, xoff=self.center_lon, yoff=self.center_lat)
+        
+        return ellipse
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -162,6 +207,7 @@ class Satellite:
         self.h = h                      # Altitude of deployment
         self.power = power              # Transmission power
         self.minElevationAngle = 30     # Value is taken from NGSO constellation design chapter.
+        self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
 
         # Spherical Coordinates before inclination (r,theta,phi)
         self.r = Re+self.h 
@@ -231,17 +277,34 @@ class Satellite:
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
 
-        # The top edge of the coverage square
-        top_lat = sat_lat + (side_km / 2) * deg_per_km
+        if self.constellationType =="OneWeb":  
 
-        for i in range(n_beams):
-            # Each beam's center is halfway between its top and bottom edge
-            beam_top = top_lat - i * beam_height_deg
-            beam_bottom = beam_top - beam_height_deg
-            center_lat = (beam_top + beam_bottom) / 2
-            center_lon = sat_lon
-            beam_id = f"{self.ID}_beam_{i+1}"  # Number beams 1 to 16
-            self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg, id=beam_id))
+            # The top edge of the coverage square
+            top_lat = sat_lat + (side_km / 2) * deg_per_km
+
+            for i in range(n_beams):
+                # Each beam's center is halfway between its top and bottom edge
+                beam_top = top_lat - i * beam_height_deg
+                beam_bottom = beam_top - beam_height_deg
+                center_lat = (beam_top + beam_bottom) / 2
+                center_lon = sat_lon
+                beam_id = f"{self.ID}_beam_{i+1}"  # Number beams 1 to 16
+                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg, id=beam_id))
+        else:
+            # Center beam
+            self.beams.append(Beam(sat_lat, sat_lon, beam_width_deg, beam_height_deg))
+
+            # Beams on circle
+            n_circle_beams = n_beams - 1
+            radius_deg = beam_height_deg * 4 # Circle radius in degrees
+
+            for i in range(n_circle_beams):
+                angle = 2 * math.pi * i / n_circle_beams
+                dlat = radius_deg * math.cos(angle)
+                dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude distortion
+                center_lat = sat_lat + dlat
+                center_lon = sat_lon + dlon
+                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
 
     def maxSlantRange(self):
         """
@@ -286,21 +349,39 @@ class Satellite:
         beam_width_deg = beam_width_km * deg_per_km
         beam_height_deg = beam_height_km * deg_per_km
 
+
+
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
+        if self.constellationType =="OneWeb": 
 
-        # The top edge of the coverage square
-        top_lat = sat_lat + (side_km / 2) * deg_per_km
+            # The top edge of the coverage square
+            top_lat = sat_lat + (side_km / 2) * deg_per_km
 
-        for i in range(n_beams):
-            beam_top = top_lat - i * beam_height_deg
-            beam_bottom = beam_top - beam_height_deg
-            center_lat = (beam_top + beam_bottom) / 2
-            center_lon = sat_lon
-            self.beams[i].center_lat = center_lat
-            self.beams[i].center_lon = center_lon
-            self.beams[i].width_deg = beam_width_deg
-            self.beams[i].height_deg = beam_height_deg
+            for i in range(n_beams):
+                beam_top = top_lat - i * beam_height_deg
+                beam_bottom = beam_top - beam_height_deg
+                center_lat = (beam_top + beam_bottom) / 2
+                center_lon = sat_lon
+                self.beams[i].center_lat = center_lat
+                self.beams[i].center_lon = center_lon
+                self.beams[i].width_deg = beam_width_deg
+                self.beams[i].height_deg = beam_height_deg
+        else:
+                # Center beam
+            self.beams[0].center_lat = sat_lat
+            self.beams[0].center_lon = sat_lon
+            # 15 beams around the center in a circle
+            radius_deg = beam_height_deg * 4
+            n_beams_side = n_beams - 1
+            for i in range(0, n_beams_side):
+                angle = 2 * math.pi * i / n_beams_side
+                dlat = radius_deg * math.cos(angle)
+                dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude
+                center_lat = sat_lat + dlat
+                center_lon = sat_lon + dlon
+                self.beams[i].center_lat = center_lat
+                self.beams[i].center_lon = center_lon
 
     def adjustDownRate(self):
 
@@ -415,6 +496,7 @@ class Earth:
         [self.total_x, self.total_y] = pop_count_data.size
 
         self.total_cells = self.total_x * self.total_y
+        self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
 
         # window is a list with the coordinate bounds of our window of interest
         # format for window = [western longitude, eastern longitude, southern latitude, northern latitude]
@@ -477,18 +559,33 @@ class Earth:
         ax.set_global()
 
         colors = matplotlib.cm.rainbow(np.linspace(0, 1, len(self.LEO)))
-            
-        for plane, c in zip(self.LEO, colors):
-            for sat in plane.sats:
-                lon = math.degrees(sat.longitude)
-                lat = math.degrees(sat.latitude)
-                if plotSat:
-                    ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
-                if plotBeams:
-                    for beam in sat.beams:
-                        footprint = beam.get_footprint()
-                        feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
-                        ax.add_feature(feature)
+        if self.constellationType =="OneWeb":
+            for plane, c in zip(self.LEO, colors):
+                for sat in plane.sats:
+                    lon = math.degrees(sat.longitude)
+                    lat = math.degrees(sat.latitude)
+                    if plotSat:
+                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
+                    if plotBeams:
+                        for beam in sat.beams:
+                            footprint = beam.get_footprint_eclipse()
+                            feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
+                            ax.add_feature(feature)
+        else:
+            for plane, c in zip(self.LEO, colors):
+                for sat in plane.sats:
+                    lon = math.degrees(sat.longitude)
+                    lat = math.degrees(sat.latitude)
+                    if plotSat:
+                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
+                    if plotBeams:
+                        sat.beams[len(sat.beams) - 1].center_lon = lon
+                        sat.beams[len(sat.beams) - 1].center_lat = lat
+                        for beam in sat.beams:
+                            beam_lon = beam.center_lon
+                            beam_lat = beam.center_lat
+                            # Draw a cross at the beam center
+                            ax.plot(beam_lon, beam_lat, marker='x', markersize=2, color='blue')
         
         # if plotSat: 
         #     plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
