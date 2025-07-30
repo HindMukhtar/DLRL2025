@@ -521,9 +521,20 @@ class Aircraft:
         idxs = tree.query_ball_point([self.latitude, self.longitude], r=threshold_deg)
 
         results = []
-        best_snr = -np.inf
-        best_sat = None
-        best_beam = None
+
+        # Initialize best_snr, best_sat, best_beam based on current beam
+        if self.beam is not None and self.satellite is not None:
+            current_dist = geopy.distance.distance(
+                (self.latitude, self.longitude),
+                (self.beam.center_lat, self.beam.center_lon)
+            ).km
+            best_snr = self.calculate_snr(self.beam, current_dist)
+            best_sat = self.satellite
+            best_beam = self.beam
+        else:
+            best_snr = -np.inf
+            best_sat = None
+            best_beam = None
 
         for idx in idxs:
             sat, beam = beam_refs[idx]
@@ -550,6 +561,7 @@ class Aircraft:
         self.beam = best_beam
 
         return results
+
     def scan_nearby(self, earth, threshold_km=500):
         results = []
         for plane in earth.LEO:
