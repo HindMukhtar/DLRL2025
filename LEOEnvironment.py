@@ -11,6 +11,12 @@ import networkx as nx
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
 import os
+import cartopy.crs as ccrs
+from shapely.geometry import Point
+from shapely.geometry.polygon import Polygon
+from cartopy.feature import ShapelyFeature
+import matplotlib.patches as mpatches
+from shapely.geometry import box
 
 ###############################################################################
 #################################    Simpy    #################################
@@ -128,6 +134,24 @@ class OrbitalPlane:
         for sat in self.sats:
             sat.rotate(delta_t, self.longitude, self.period)
 
+class Beam:
+    def __init__(self, center_lat, center_lon, width_deg, height_deg, 
+                 load=0, capacity=0, snr=0, id=None):
+        self.center_lat = center_lat
+        self.center_lon = center_lon
+        self.width_deg = width_deg
+        self.height_deg = height_deg
+        self.load = load
+        self.capacity = capacity
+        self.snr = snr
+        self.id = id  # Optional: unique identifier for the beam
+
+    def get_footprint(self):
+        min_lon = self.center_lon - self.width_deg / 2
+        max_lon = self.center_lon + self.width_deg / 2
+        min_lat = self.center_lat - self.height_deg / 2
+        max_lat = self.center_lat + self.height_deg / 2
+        return box(min_lon, min_lat, max_lon, max_lat)
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -188,6 +212,29 @@ class Satellite:
         # simpy
         self.env = env
 
+        # Satellite beams - assuming OneWeb beams right now 
+        self.beams = []
+        self.init_beams()
+
+    def init_beams(self):
+        # OneWeb: coverage area is a square, divided into 16 horizontal rectangles
+        total_area_km2 = 1_718_000
+        side_km = total_area_km2 ** 0.5  # side of the square in km
+        deg_per_km = 1 / 111  # 1 degree latitude ≈ 111 km
+        side_deg = side_km * deg_per_km
+        n_beams = 16
+        beam_height_deg = side_deg / n_beams
+        beam_width_deg = side_deg
+
+        sat_lat = math.degrees(self.latitude)
+        sat_lon = math.degrees(self.longitude)
+
+        # Center the grid on the satellite
+        for i in range(n_beams):
+            center_lat = sat_lat + (i - (n_beams - 1) / 2) * beam_height_deg
+            center_lon = sat_lon
+            self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
+
     def maxSlantRange(self):
         """
         Maximum distance from satellite to edge of coverage area is calculated using the following formula:
@@ -218,6 +265,29 @@ class Satellite:
                 '%.2f' % math.degrees(self.polar_angle),
                 '%.2f' % math.degrees(self.latitude),
                 '%.2f' % math.degrees(self.longitude))
+
+    def update_beams(self):
+        # Recalculate beam centers based on current satellite position
+        total_area_km2 = 1_718_000
+        side_km = total_area_km2 ** 0.5
+        deg_per_km = 1 / 111
+        side_deg = side_km * deg_per_km
+        n_beams_side = 4
+        beam_width_deg = side_deg / n_beams_side
+        beam_height_deg = side_deg / n_beams_side
+
+        sat_lat = math.degrees(self.latitude)
+        sat_lon = math.degrees(self.longitude)
+
+        idx = 0
+        for i in range(n_beams_side):
+            for j in range(n_beams_side):
+                center_lat = sat_lat + (i - 1.5) * beam_height_deg
+                center_lon = sat_lon + (j - 1.5) * beam_width_deg
+                # Update existing beam objects
+                self.beams[idx].center_lat = center_lat
+                self.beams[idx].center_lon = center_lon
+                idx += 1
 
     def adjustDownRate(self):
 
@@ -282,6 +352,7 @@ class Satellite:
             self.longitude = -math.pi/2
         else:
             self.longitude = 0
+        self.update_beams()
 
 # A single cell on earth
 class Cell:
@@ -384,33 +455,38 @@ class Earth:
                 constellation.rotate(deltaT)
             yield env.timeout(deltaT)    
 
-    def plotMap(self, plotSat = True, path = None, bottleneck = None):
+    def plotMap(self, plotSat = True, plotBeams = True, path = None, bottleneck = None):
         print("Plotting map")
-        plt.figure()
+        #plt.figure()
+        fig = plt.figure(figsize=(12, 6))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        ax.coastlines()
+        ax.set_global()
 
         colors = matplotlib.cm.rainbow(np.linspace(0, 1, len(self.LEO)))
             
-        if plotSat:    
-            for plane, c in zip(self.LEO, colors):
-                # print('------------------------------------------------------------')
-                # print('Plane: ' + str(plane.ID))
-                for sat in plane.sats:
-                    gridSatX = int((0.5 + math.degrees(sat.longitude) / 360) * 1440)
-                    gridSatY = int((0.5 - math.degrees(sat.latitude) / 180) * 720) #GT.totalY)
-                    scat2 = plt.scatter(gridSatX, gridSatY, marker='o', s=18, linewidth=0.5, color=c, label = sat.ID)
-                    # print('Longitude: ' + str(math.degrees(sat.longitude)) +  ', Grid X: ' + str(gridSatX) + '\nLatitude: ' + str(math.degrees(sat.latitude)) + ', Grid Y: ' + str(gridSatY))
-                        # Longitude +-180º, latitude +-90º
+        for plane, c in zip(self.LEO, colors):
+            for sat in plane.sats:
+                lon = math.degrees(sat.longitude)
+                lat = math.degrees(sat.latitude)
+                if plotSat:
+                    ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
+                if plotBeams:
+                    for beam in sat.beams:
+                        footprint = beam.get_footprint()
+                        feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
+                        ax.add_feature(feature)
         
-        if plotSat: 
-            plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
+        # if plotSat: 
+        #     plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
 
-        plt.xticks([])
-        plt.yticks([])
+        # plt.xticks([])
+        # plt.yticks([])
         #plt.imshow(np.log10(np.array(self.getCellUsers()).transpose() + 1), )
         # plt.title('LEO constellation and Ground Terminals')
         # plt.rcParams['figure.figsize'] = 36, 12  # adjust if figure is too big or small for screen
         # plt.colorbar(fraction=0.1)  # adjust fraction to change size of color bar
-        # plt.show()
+        #plt.show()
 
     def plot3D(self):
         fig = plt.figure()
@@ -572,8 +648,7 @@ def main():
     inputParams = pd.read_csv("input.csv")
 
 
-    #testLength = inputParams['Test length'][0]
-    testLength = 60
+    testLength = inputParams['Test length'][0]
 
     # movement time should be in the order of 10's of hours when the test type is "Rates".
     # If the test is not 'Rates', the movement time is still kept large to avoid the constellation moving
