@@ -639,10 +639,10 @@ class Aircraft:
         demand = self.demand  # in MB (as per your get_demand_at_time)
 
         # Get available capacity from the current beam (in Gbps, convert to MB for deltaT)
-        if self.beam is not None:
+        if self.connected_beam is not None:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
-            beam_capacity_MB = self.beam.capacity * 125 * deltaT  # MB for this timestep
+            beam_capacity_MB = self.connected_beam.capacity * 125 * deltaT  # MB for this timestep
         else:
             beam_capacity_MB = 0
 
@@ -664,11 +664,30 @@ class Aircraft:
         """
         # Convert speed from km/h to degrees per interval
         distance_km_per_interval = (self.speed_kmph / 3600) * self.update_interval
+            # Convert distance in km to angular distance in radians on Earth's surface
+        angular_distance_rad = distance_km_per_interval * 1000 / Re # Convert km to meters for Re
+
+        # Current position in radians
+        lat_rad = math.radians(self.latitude)
+        lon_rad = math.radians(self.longitude)
+
+        # Calculate new position using spherical trigonometry (Haversine formula for destination point)
+        new_lat_rad = math.asin(math.sin(lat_rad) * math.cos(angular_distance_rad) +
+                                math.cos(lat_rad) * math.sin(angular_distance_rad) * math.cos(self.direction_rad))
         
+        new_lon_rad = lon_rad + math.atan2(math.sin(self.direction_rad) * math.sin(angular_distance_rad) * math.cos(lat_rad),
+                                           math.cos(angular_distance_rad) - math.sin(lat_rad) * math.sin(new_lat_rad))
+
+        self.latitude = math.degrees(new_lat_rad)
+        self.longitude = math.degrees(new_lon_rad)
+        
+        # Ensure longitude stays within -180 to +180
+        self.longitude = (self.longitude + 180) % 360 - 180   
+
     def move_and_connect_aircraft(self):
 
         # 1. Move the aircraft
-        self._update_position()
+        self._update_position() # we wont move the aircraft for now to simplify the simulation
 
         # 2. Find the best beam using the efficient KDTree scan
         best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance)
@@ -707,16 +726,16 @@ class Aircraft:
             self.current_latency = self._calculate_latency()
             print(f"Time {self.env.now:.2f}: Aircraft {self.id} remains connected to {self.connected_beam.id}. SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms")      
 
-     def _calculate_3d_distance(self, satellite):
+    def _calculate_3d_distance(self, satellite):
         """Calculates the 3D slant range from aircraft to satellite."""
         # Calculate 2D distance on Earth's surface
         dist_2d_km = geopy.distance.geodesic((self.latitude, self.longitude), 
-                                                (math.degrees(satellite.latitude), 
-                                                math.degrees(satellite.longitude))).km
-        
+                                            (math.degrees(satellite.latitude), 
+                                            math.degrees(satellite.longitude))).km
+
         # Altitude difference
         altitude_diff_m = (satellite.h - self.height) # Satellite altitude - aircraft height
-        
+
         # Total 3D distance using Pythagorean theorem (approximation)
         total_distance_m = math.sqrt((dist_2d_km * 1000)**2 + (altitude_diff_m)**2)
         return total_distance_m
@@ -733,51 +752,32 @@ class Aircraft:
         return 0           
             
 # A single cell on earth
-class Cell:
-    def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=200e6, noise_power=1 / (1e11)):
-        # X and Y coordinates of the cell on the dataset map
-        self.map_x = cell_x
-        self.map_y = cell_y
-        # Latitude and longitude of the cell as per dataset map
-        self.latitude = math.pi * (0.5 - cell_y / total_y)
-        self.longitude = (cell_x / total_x - 0.5) * 2 * math.pi
-        if self.latitude < -5 or self.longitude < -5:
-            print("less than 0")
-            print(self.longitude, self.latitude)
-            print(cell_x, cell_y)
-        # Actual area the cell covers on earth (scaled for)
-        self.area = 4 * math.pi * Re * Re * math.cos(self.latitude) / (total_x * total_y)
-        # X,Y,Z coordinates to the center of the cell (assumed)
-        self.x = Re * math.cos(self.latitude) * math.cos(self.longitude)
-        self.y = Re * math.cos(self.latitude) * math.sin(self.longitude)
-        self.z = Re * math.sin(self.latitude)
+# not sure we need this class anymore, as we are using beams instead of cells
+# class Cell:
+#     def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=200e6, noise_power=1 / (1e11)):
+#         # X and Y coordinates of the cell on the dataset map
+#         self.map_x = cell_x
+#         self.map_y = cell_y
+#         # Latitude and longitude of the cell as per dataset map
+#         self.latitude = math.pi * (0.5 - cell_y / total_y)
+#         self.longitude = (cell_x / total_x - 0.5) * 2 * math.pi
+#         if self.latitude < -5 or self.longitude < -5:
+#             print("less than 0")
+#             print(self.longitude, self.latitude)
+#             print(cell_x, cell_y)
+#         # Actual area the cell covers on earth (scaled for)
+#         self.area = 4 * math.pi * Re * Re * math.cos(self.latitude) / (total_x * total_y)
+#         # X,Y,Z coordinates to the center of the cell (assumed)
+#         self.x = Re * math.cos(self.latitude) * math.cos(self.longitude)
+#         self.y = Re * math.cos(self.latitude) * math.sin(self.longitude)
+#         self.z = Re * math.sin(self.latitude)
 
-        self.users = users  # Population in the cell
-        self.f = f  # Frequency used by the cell
-        self.bw = bw  # Bandwidth used for the cell
-        self.noise_power = noise_power  # Noise power for the cell
-        self.rejected = True  # Usefulfor applications process to show if the cell is rejected or accepted
-        self.gateway = None  # (groundstation, distance)
-
-        # Convert distance in km to angular distance in radians on Earth's surface
-        angular_distance_rad = distance_km_per_interval * 1000 / Re # Convert km to meters for Re
-
-        # Current position in radians
-        lat_rad = math.radians(self.latitude)
-        lon_rad = math.radians(self.longitude)
-
-        # Calculate new position using spherical trigonometry (Haversine formula for destination point)
-        new_lat_rad = math.asin(math.sin(lat_rad) * math.cos(angular_distance_rad) +
-                                math.cos(lat_rad) * math.sin(angular_distance_rad) * math.cos(self.direction_rad))
-        
-        new_lon_rad = lon_rad + math.atan2(math.sin(self.direction_rad) * math.sin(angular_distance_rad) * math.cos(lat_rad),
-                                           math.cos(angular_distance_rad) - math.sin(lat_rad) * math.sin(new_lat_rad))
-
-        self.latitude = math.degrees(new_lat_rad)
-        self.longitude = math.degrees(new_lon_rad)
-        
-        # Ensure longitude stays within -180 to +180
-        self.longitude = (self.longitude + 180) % 360 - 180
+#         self.users = users  # Population in the cell
+#         self.f = f  # Frequency used by the cell
+#         self.bw = bw  # Bandwidth used for the cell
+#         self.noise_power = noise_power  # Noise power for the cell
+#         self.rejected = True  # Usefulfor applications process to show if the cell is rejected or accepted
+#         self.gateway = None  # (groundstation, distance)
 
 
 # Earth consisting of cells
@@ -854,12 +854,13 @@ class Earth:
         """
         while True:
             for ac in self.aircraft:
-                scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
+                #scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
+                ac.move_and_connect_aircraft()  # Move aircraft and manage connections
                 ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
-                print(f"\n[SimTime {env.now}] Aircraft {ac.ID} scan:")
-                for result in scan_results:
-                    if result['type'] == 'beam':
-                        print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
+                print(f"\n[SimTime {env.now}] Aircraft {ac.id} scan:")
+                # for result in scan_results:
+                #     if result['type'] == 'beam':
+                #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
                 print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
             yield env.timeout(deltaT)             
 
@@ -1128,10 +1129,10 @@ def main():
         Image.new('L', (500, 250)).save(img_path)
 
 
-    earth_instance, aircraft1 = initialize(env, img_path, inputParams, movementTime)
+    earth_instance = initialize(env, img_path, inputParams, movementTime)
 
     # --- Aircraft Simulation ---
-    all_aircrafts = [aircraft1] # List of all aircrafts to pass to plotting function
+    all_aircrafts = earth_instance.aircraft # List of all aircrafts to pass to plotting function
 
     # Start plotting process to save map images at intervals
     # plotAircrafts is set to True to show aircraft on the map
@@ -1142,15 +1143,16 @@ def main():
     env.run(simulationTimelimit)
     timeToSim = time.time() - startTime
 
-    print("\n\n--- Simulation Summary ---")
-    print(f"Total simulation run time: {timeToSim:.2f} seconds")
-    print(f"Aircraft '{aircraft1.id}' total handovers: {aircraft1.handover_count}")
-    if aircraft1.connected_beam:
-        print(f"Aircraft '{aircraft1.id}' final connected beam: {aircraft1.connected_beam.id}")
-        print(f"Aircraft '{aircraft1.id}' final SNR: {aircraft1.current_snr:.2f} dB")
-        print(f"Aircraft '{aircraft1.id}' final Latency: {aircraft1.current_latency*1e3:.2f} ms")
-    else:
-        print(f"Aircraft '{aircraft1.id}' ended the simulation with no connection.")
+    for aircraft in all_aircrafts:
+        print("\n\n--- Simulation Summary ---")
+        print(f"Total simulation run time: {timeToSim:.2f} seconds")
+        print(f"Aircraft '{aircraft.id}' total handovers: {aircraft.handover_count}")
+        if aircraft.connected_beam:
+            print(f"Aircraft '{aircraft.id}' final connected beam: {aircraft.connected_beam.id}")
+            print(f"Aircraft '{aircraft.id}' final SNR: {aircraft.current_snr:.2f} dB")
+            print(f"Aircraft '{aircraft.id}' final Latency: {aircraft.current_latency*1e3:.2f} ms")
+        else:
+            print(f"Aircraft '{aircraft.id}' ended the simulation with no connection.")
 
 
 if __name__ == '__main__':
