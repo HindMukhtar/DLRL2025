@@ -26,6 +26,8 @@ import numpy as np
 ###############################################################################
 #################################    Simpy    #################################
 ###############################################################################
+receivedDataBlocks = []
+createdBlocks = []
 seed = np.random.seed(1)
 
 upGSLRates = []
@@ -146,6 +148,7 @@ class Beam:
         self.load = load
         self.snr = snr
         self.id = id  # Optional: unique identifier for the beam
+        self._calculate_ellipse_parameters()
         
         if constellation == 'OneWeb': 
             self.max_capacity = 7.2 #Gbps 
@@ -157,17 +160,19 @@ class Beam:
             self.Pt = 40 #dBm - transmit power 
             self.Gt = 30 #dBi - antenna gain 
         
-        semi_axis_x = self.width_deg / 2.0
-        semi_axis_y = self.height_deg / 2.0
+    
+    def _calculate_ellipse_parameters(self):
+        """Calculates semi_major_axis, semi_minor_axis, and orientation_angle."""
+        semi_axis_x_half = abs(self.width_deg / 2.0)
+        semi_axis_y_half = abs(self.height_deg / 2.0)
 
-        self.semi_major_axis = max(semi_axis_x, semi_axis_y)
-        self.semi_minor_axis = min(semi_axis_x, semi_axis_y)
-        if self.width_deg >= self.height_deg:
-            # Major axis is horizontal (along longitude)
-            self.orientation_angle = 0.0
+        self.semi_major_axis = max(semi_axis_x_half, semi_axis_y_half)
+        self.semi_minor_axis = min(semi_axis_x_half, semi_axis_y_half)
+
+        if semi_axis_x_half >= semi_axis_y_half:
+            self.orientation_angle = 0.0  # Major axis is along the x-direction (longitude)
         else:
-            # Major axis is vertical (along latitude)
-            self.orientation_angle = 90.0
+            self.orientation_angle = 90.0 # Major axis is along the y-direction (latitude)
 
     def get_footprint(self):
         min_lon = self.center_lon - self.width_deg / 2
@@ -177,10 +182,9 @@ class Beam:
         return box(min_lon, min_lat, max_lon, max_lat)
     
     def get_footprint_eclipse(self, num_segments=100):
-        # Create a circle, then scale and rotate it to form an ellipse
-        # This approach is often easier than generating points directly for an ellipse
-        
-        # Start with a unit circle centered at (0,0)
+        """
+        Generates a Shapely Polygon representing the elliptical footprint.
+        """
         circle_points = []
         for i in range(num_segments):
             angle = 2 * math.pi * i / num_segments
@@ -188,24 +192,17 @@ class Beam:
             y = math.sin(angle)
             circle_points.append((x, y))
         
-        # Create a Polygon from the circle points
-        ellipse = Polygon(circle_points)
+        ellipse_base = Polygon(circle_points)
         
-        # Scale to desired semi-axes (assuming semi_major_axis along x, semi_minor_axis along y initially)
-        # Note: You might need to swap these depending on your desired ellipse orientation
-        ellipse = scale(ellipse, self.semi_major_axis, self.semi_minor_axis, origin=(0,0))
+        if self.orientation_angle == 0.0:
+            scaled_ellipse = scale(ellipse_base, self.semi_major_axis, self.semi_minor_axis, origin=(0,0))
+        else: # self.orientation_angle == 90.0
+            scaled_ellipse = scale(ellipse_base, self.semi_minor_axis, self.semi_major_axis, origin=(0,0))
+            scaled_ellipse = rotate(scaled_ellipse, self.orientation_angle, origin=(0,0))
+
+        final_ellipse = translate(scaled_ellipse, xoff=self.center_lon, yoff=self.center_lat)
         
-        # Rotate to the desired orientation
-        ellipse = rotate(ellipse, self.orientation_angle, origin=(0,0))
-        
-        # Translate to the beam's center (lon, lat)
-        # Assuming your lon/lat are in degrees and represent a flat projection for this
-        # If working with spherical coordinates, this will be more complex and require
-        # projecting points onto a 2D plane before forming the ellipse, then projecting back,
-        # or using a library that handles geodesic ellipses.
-        ellipse = translate(ellipse, xoff=self.center_lon, yoff=self.center_lat)
-        
-        return ellipse
+        return final_ellipse
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -376,10 +373,12 @@ class Satellite:
                 self.beams[i].center_lon = center_lon
                 self.beams[i].width_deg = beam_width_deg
                 self.beams[i].height_deg = beam_height_deg
+                self.beams[i]._calculate_ellipse_parameters()
         else:
                 # Center beam
             self.beams[0].center_lat = sat_lat
             self.beams[0].center_lon = sat_lon
+            self.beams[0]._calculate_ellipse_parameters() 
             # 15 beams around the center in a circle
             radius_deg = beam_height_deg * 4
             n_beams_side = n_beams - 1
@@ -391,6 +390,7 @@ class Satellite:
                 center_lon = sat_lon + dlon
                 self.beams[i].center_lat = center_lat
                 self.beams[i].center_lon = center_lon
+                self.beams[i]._calculate_ellipse_parameters()
 
     def adjustDownRate(self):
 
@@ -699,45 +699,61 @@ class Earth:
                 constellation.rotate(deltaT)
             yield env.timeout(deltaT)    
 
-    def plotMap(self, plotSat = True, plotBeams = True, path = None, bottleneck = None):
+    def plotMap(self, plotSat = True, plotBeams = True, plotUsers = True, users=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
-        #plt.figure()
         fig = plt.figure(figsize=(12, 6))
         ax = plt.axes(projection=ccrs.PlateCarree())
         ax.coastlines()
         ax.set_global()
 
         colors = matplotlib.cm.rainbow(np.linspace(0, 1, len(self.LEO)))
-        if self.constellationType =="OneWeb":
-            for plane, c in zip(self.LEO, colors):
-                for sat in plane.sats:
-                    lon = math.degrees(sat.longitude)
-                    lat = math.degrees(sat.latitude)
-                    if plotSat:
-                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
-                    if plotBeams:
-                        for beam in sat.beams:
-                            footprint = beam.get_footprint_eclipse()
-                            feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
-                            ax.add_feature(feature)
-        else:
-            for plane, c in zip(self.LEO, colors):
-                for sat in plane.sats:
-                    lon = math.degrees(sat.longitude)
-                    lat = math.degrees(sat.latitude)
-                    if plotSat:
-                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
-                    if plotBeams:
-                        sat.beams[len(sat.beams) - 1].center_lon = lon
-                        sat.beams[len(sat.beams) - 1].center_lat = lat
-                        for beam in sat.beams:
-                            beam_lon = beam.center_lon
-                            beam_lat = beam.center_lat
-                            # Draw a cross at the beam center
-                            ax.plot(beam_lon, beam_lat, marker='x', markersize=2, color='blue')
         
-        # if plotSat: 
-        #     plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
+        for plane, c in zip(self.LEO, colors):
+            for sat in plane.sats:
+                lon = math.degrees(sat.longitude)
+                lat = math.degrees(sat.latitude)
+                if plotSat:
+                    ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree(), label='Satellites' if plane.ID == self.LEO[0].ID and sat.ID == plane.sats[0].ID else "")
+                if plotBeams: # Only plot beams if plotBeams is True
+                    for beam in sat.beams:
+                        # Determine color and linewidth based on whether it's the selected beam
+                        if selected_beam_id and beam.id == selected_beam_id:
+                            edge_color = 'red'
+                            line_width = 1.5
+                            alpha_val = 1.0
+                        else:
+                            edge_color = 'lightblue' # Very light color for other beams
+                            line_width = 0.4
+                            alpha_val = 0.5 # Make it semi-transparent
+
+                        footprint = beam.get_footprint_eclipse()
+                        feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor=edge_color, facecolor='none', linewidth=line_width, alpha=alpha_val)
+                        ax.add_feature(feature)
+        
+        if plotUsers and users: # Only plot users if plotUsers is True and users list is provided
+            user_lons = [user.longitude for user in users]
+            user_lats = [user.latitude for user in users]
+            ax.scatter(user_lons, user_lats, color='black', marker='x', s=50, transform=ccrs.PlateCarree(), label='Users')
+            
+            # Optionally plot user connection lines
+            for user in users:
+                if user.connected_satellite:
+                    user_lon_rad = math.radians(user.longitude)
+                    user_lat_rad = math.radians(user.latitude)
+                    sat_lon_rad = user.connected_satellite.longitude
+                    sat_lat_rad = user.connected_satellite.latitude
+                    
+                    # Convert to degrees for plotting
+                    line_lons = [user.longitude, math.degrees(sat_lon_rad)]
+                    line_lats = [user.latitude, math.degrees(sat_lat_rad)]
+                    ax.plot(line_lons, line_lats, color='green', linewidth=0.8, linestyle='--', transform=ccrs.PlateCarree())
+
+
+        # Create a single legend for all plotted elements
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            plt.legend(by_label.values(), by_label.keys(), loc='lower left', prop={'size': 8})
 
         # plt.xticks([])
         # plt.yticks([])
@@ -762,11 +778,12 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
-    def save_plot_at_intervals(self, env, interval=1):
+    def save_plot_at_intervals(self, env, interval=1, plotSat=True, plotBeams=True, plotUsers=False, users=None):
         img_count = 0
         while True:
             print(f"Saving plot {img_count} at simulation time {env.now}")
-            self.plotMap(plotSat=True)
+            selected_beam_id = users[0].connected_beam.id if users and users[0].connected_beam else None
+            self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotUsers=plotUsers, users=users, selected_beam_id=selected_beam_id)
             plt.savefig(f"simulationImages/sat_positions_{img_count}.png")
             plt.close()
             img_count += 1
