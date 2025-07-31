@@ -214,6 +214,7 @@ class Satellite:
         self.power = power              # Transmission power
         self.minElevationAngle = 30     # Value is taken from NGSO constellation design chapter.
         self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
+        self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
 
         # Spherical Coordinates before inclination (r,theta,phi)
         self.r = Re+self.h 
@@ -270,9 +271,17 @@ class Satellite:
 
     def init_beams(self):
         # OneWeb: coverage area is a square, divided into 16 horizontal strips (vertically stacked)
+        # OneWeb: coverage area is a square, divided into 16 horizontal strips (vertically stacked)
         total_area_km2 = 1_718_000
         side_km = total_area_km2 ** 0.5  # ≈ 1310 km
+        side_km = total_area_km2 ** 0.5  # ≈ 1310 km
         n_beams = 16
+        beam_width_km = side_km
+        beam_height_km = side_km / n_beams  # ≈ 81.9 km
+
+        deg_per_km = 1 / 111  # Approximate conversion
+        beam_width_deg = beam_width_km * deg_per_km
+        beam_height_deg = beam_height_km * deg_per_km
         beam_width_km = side_km
         beam_height_km = side_km / n_beams  # ≈ 81.9 km
 
@@ -283,6 +292,34 @@ class Satellite:
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
 
+        if self.constellationType =="OneWeb":  
+
+            # The top edge of the coverage square
+            top_lat = sat_lat + (side_km / 2) * deg_per_km
+
+            for i in range(n_beams):
+                # Each beam's center is halfway between its top and bottom edge
+                beam_top = top_lat - i * beam_height_deg
+                beam_bottom = beam_top - beam_height_deg
+                center_lat = (beam_top + beam_bottom) / 2
+                center_lon = sat_lon
+                beam_id = f"{self.ID}_beam_{i+1}"  # Number beams 1 to 16
+                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg, id=beam_id))
+        else:
+            # Center beam
+            self.beams.append(Beam(sat_lat, sat_lon, beam_width_deg, beam_height_deg))
+
+            # Beams on circle
+            n_circle_beams = n_beams - 1
+            radius_deg = beam_height_deg * 4 # Circle radius in degrees
+
+            for i in range(n_circle_beams):
+                angle = 2 * math.pi * i / n_circle_beams
+                dlat = radius_deg * math.cos(angle)
+                dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude distortion
+                center_lat = sat_lat + dlat
+                center_lon = sat_lon + dlon
+                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
         if self.constellationType =="OneWeb":  
 
             # The top edge of the coverage square
@@ -346,6 +383,16 @@ class Satellite:
     def update_beams(self):
         # Recalculate beam centers based on current satellite position
         total_area_km2 = 1_718_000
+        side_km = total_area_km2 ** 0.5  # ≈ 1310 km
+        n_beams = 16
+        beam_width_km = side_km
+        beam_height_km = side_km / n_beams  # ≈ 81.9 km
+
+        deg_per_km = 1 / 111  # Approximate conversion
+        beam_width_deg = beam_width_km * deg_per_km
+        beam_height_deg = beam_height_km * deg_per_km
+
+
         side_km = total_area_km2 ** 0.5  # ≈ 1310 km
         n_beams = 16
         beam_width_km = side_km
@@ -645,6 +692,7 @@ class Earth:
         [self.total_x, self.total_y] = pop_count_data.size
 
         self.total_cells = self.total_x * self.total_y
+        self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
         self.constellationType = "OneWeb"  # Type of constellation, used for beam initialization
 
         # window is a list with the coordinate bounds of our window of interest
