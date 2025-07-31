@@ -143,26 +143,26 @@ class OrbitalPlane:
 
 class Beam:
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
-                 load=0, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
+                 load=1, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
         self.center_lat = center_lat
         self.center_lon = center_lon
         self.width_deg = width_deg
         self.height_deg = height_deg
         self.load = load # Current number of users connected
-        self.capacity = capacity # Max number of users or data rate
         self.snr = snr # Base SNR, will be adjusted for user position
         self.id = id  # Optional: unique identifier for the beam
-        self.load_amplitude = 0 
-        self.load_frequency = 2 * math.pi / 900 
+        self.load_amplitude = 0.5 
+        self.load_frequency = 2 * math.pi / 10 
         self.load_phase = random.uniform(0, 2 * math.pi)
-        self.base_load = 0 
+        self.base_load = 0.5 
         
         # Calculate ellipse parameters based on width_deg and height_deg
         self._calculate_ellipse_parameters()
 
         if constellation == 'OneWeb': 
-            self.max_capacity = 7.2 #Gbps 
-            self.capacity = self.max_capacity
+            #self.max_capacity = 7.2 #Gbps 
+            self.max_capacity = 0.5 #Gbps reduce for now as we only have a single agent 
+            self.capacity = self.max_capacity*self.load
             self.max_ds_speed = 150 #Mbps 
             self.max_us_speed = 30 #Mbps 
             self.max_latency = 70 #ms 
@@ -617,7 +617,7 @@ class Aircraft:
             Demand in Mbps
         """
         num_users = random.randint(1, 10)  # 1 to 10 users
-        demand_per_user = [random.uniform(2, 25) for _ in range(num_users)]  # 2–25 Mbps per user
+        demand_per_user = [random.uniform(0, 25) for _ in range(num_users)]  # 2–25 Mbps per user
         total_demand = sum(demand_per_user)
         return (total_demand*deltaT)/8 #Total data transferred in megabytes   
 
@@ -687,7 +687,7 @@ class Aircraft:
     def move_and_connect_aircraft(self):
 
         # 1. Move the aircraft
-        self._update_position() # we wont move the aircraft for now to simplify the simulation
+        #self._update_position() # we wont move the aircraft for now to simplify the simulation
 
         # 2. Find the best beam using the efficient KDTree scan
         best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance)
@@ -709,7 +709,7 @@ class Aircraft:
             #self.connected_beam.load += 1
             self.current_snr = best_snr
             self.current_latency = self._calculate_latency() # Update latency
-            print(f"  >> New Status: SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms, Beam Load: {self.connected_beam.load}/{self.connected_beam.capacity}")
+            print(f"  >> New Status: SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms, Beam Load: {self.connected_beam.load}, Beam Capacity:{self.connected_beam.capacity}")
 
         elif not best_candidate_beam and self.connected_beam:
             # Lost connection
@@ -990,7 +990,7 @@ def initialize(env, img_path, inputParams, movementTime):
     constellationType = inputParams['Constellation'][0]
 
     # Load earth and gateways
-    aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=50000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
+    aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=80000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, img_path,  constellationType, [aircraft1], inputParams, movementTime)
 
     print("Initialized Earth")
@@ -1113,7 +1113,7 @@ def main():
     constellation_name = inputParams['Constellation'][0]
 
     # Time interval for constellation movement updates
-    movementTime = 10
+    movementTime = 20
     print(f"Constellation: {constellation_name}")
     print(f"Constellation movement update interval: {movementTime} seconds")
 
