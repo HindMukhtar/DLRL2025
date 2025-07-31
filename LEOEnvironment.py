@@ -27,6 +27,9 @@ import random
 ###############################################################################
 #################################    Simpy    #################################
 ###############################################################################
+
+receivedDataBlocks = []
+createdBlocks = []
 seed = np.random.seed(1)
 
 upGSLRates = []
@@ -140,43 +143,49 @@ class OrbitalPlane:
 
 class Beam:
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
-                 load=0, capacity=0, snr=0, id=None, constellation = 'OneWeb'):
+                 load=0, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
         self.center_lat = center_lat
         self.center_lon = center_lon
         self.width_deg = width_deg
         self.height_deg = height_deg
-        self.load = load
-        self.snr = snr
+        self.load = load # Current number of users connected
+        self.capacity = capacity # Max number of users or data rate
+        self.snr = snr # Base SNR, will be adjusted for user position
         self.id = id  # Optional: unique identifier for the beam
         self.load_amplitude = 0 
         self.load_frequency = 2 * math.pi / 900 
         self.load_phase = random.uniform(0, 2 * math.pi)
         self.base_load = 0 
         
+        # Calculate ellipse parameters based on width_deg and height_deg
+        self._calculate_ellipse_parameters()
+
         if constellation == 'OneWeb': 
             self.max_capacity = 7.2 #Gbps 
             self.capacity = self.max_capacity
             self.max_ds_speed = 150 #Mbps 
             self.max_us_speed = 30 #Mbps 
-            self.max_latency = 70 #Mbps 
-            self.bw = 250e6 #Mhz 
+            self.max_latency = 70 #ms 
+            self.bw = 250e6 #Hz 
             self.frequency = 15 #GHz 
             self.Pt = 40 #dBm - transmit power 
             self.Gt = 30 #dBi - antenna gain 
         
-        semi_axis_x = self.width_deg / 2.0
-        semi_axis_y = self.height_deg / 2.0
+    def _calculate_ellipse_parameters(self):
+        """Calculates semi_major_axis, semi_minor_axis, and orientation_angle."""
+        semi_axis_x_half = abs(self.width_deg / 2.0)
+        semi_axis_y_half = abs(self.height_deg / 2.0)
 
-        self.semi_major_axis = max(semi_axis_x, semi_axis_y)
-        self.semi_minor_axis = min(semi_axis_x, semi_axis_y)
-        if self.width_deg >= self.height_deg:
-            # Major axis is horizontal (along longitude)
-            self.orientation_angle = 0.0
+        self.semi_major_axis = max(semi_axis_x_half, semi_axis_y_half)
+        self.semi_minor_axis = min(semi_axis_x_half, semi_axis_y_half)
+
+        if semi_axis_x_half >= semi_axis_y_half:
+            self.orientation_angle = 0.0  # Major axis is along the x-direction (longitude)
         else:
-            # Major axis is vertical (along latitude)
-            self.orientation_angle = 90.0
+            self.orientation_angle = 90.0 # Major axis is along the y-direction (latitude)
 
     def get_footprint(self):
+        # This method is kept for compatibility but get_footprint_eclipse is preferred
         min_lon = self.center_lon - self.width_deg / 2
         max_lon = self.center_lon + self.width_deg / 2
         min_lat = self.center_lat - self.height_deg / 2
@@ -184,10 +193,9 @@ class Beam:
         return box(min_lon, min_lat, max_lon, max_lat)
     
     def get_footprint_eclipse(self, num_segments=100):
-        # Create a circle, then scale and rotate it to form an ellipse
-        # This approach is often easier than generating points directly for an ellipse
-        
-        # Start with a unit circle centered at (0,0)
+        """
+        Generates a Shapely Polygon representing the elliptical footprint.
+        """
         circle_points = []
         for i in range(num_segments):
             angle = 2 * math.pi * i / num_segments
@@ -195,25 +203,17 @@ class Beam:
             y = math.sin(angle)
             circle_points.append((x, y))
         
-        # Create a Polygon from the circle points
-        ellipse = Polygon(circle_points)
+        ellipse_base = Polygon(circle_points)
         
-        # Scale to desired semi-axes (assuming semi_major_axis along x, semi_minor_axis along y initially)
-        # Note: You might need to swap these depending on your desired ellipse orientation
-        ellipse = scale(ellipse, self.semi_major_axis, self.semi_minor_axis, origin=(0,0))
-        
-        # Rotate to the desired orientation
-        ellipse = rotate(ellipse, self.orientation_angle, origin=(0,0))
-        
-        # Translate to the beam's center (lon, lat)
-        # Assuming your lon/lat are in degrees and represent a flat projection for this
-        # If working with spherical coordinates, this will be more complex and require
-        # projecting points onto a 2D plane before forming the ellipse, then projecting back,
-        # or using a library that handles geodesic ellipses.
-        ellipse = translate(ellipse, xoff=self.center_lon, yoff=self.center_lat)
-        
-        return ellipse
-    
+        if self.orientation_angle == 0.0:
+            scaled_ellipse = scale(ellipse_base, self.semi_major_axis, self.semi_minor_axis, origin=(0,0))
+        else: # self.orientation_angle == 90.0
+            scaled_ellipse = scale(ellipse_base, self.semi_minor_axis, self.semi_major_axis, origin=(0,0))
+            scaled_ellipse = rotate(scaled_ellipse, self.orientation_angle, origin=(0,0))
+
+        final_ellipse = translate(scaled_ellipse, xoff=self.center_lon, yoff=self.center_lat)
+        return final_ellipse
+
     def get_load_at_time(self, time_seconds):
         """
         Calculate the load at a given time using a sinusoidal function.
@@ -296,6 +296,7 @@ class Satellite:
         min_rate = 10e3  # Minimum rate in kbps
         self.ngeo2gt = RFlink(f, B, maxPtx, Adtx, Adrx, pL, Nf, Tn, min_rate)
         self.downRate = 0
+        self.base_snr_at_center = 0 # To store the base SNR for beams
 
         # simpy
         self.env = env
@@ -392,10 +393,9 @@ class Satellite:
         beam_height_deg = beam_height_km * deg_per_km
 
 
-
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
-        if self.constellationType =="OneWeb": 
+        if self.constellationType =="OneWeb":  
 
             # The top edge of the coverage square
             top_lat = sat_lat + (side_km / 2) * deg_per_km
@@ -409,10 +409,12 @@ class Satellite:
                 self.beams[i].center_lon = center_lon
                 self.beams[i].width_deg = beam_width_deg
                 self.beams[i].height_deg = beam_height_deg
+                self.beams[i]._calculate_ellipse_parameters() # Recalculate ellipse params
         else:
                 # Center beam
             self.beams[0].center_lat = sat_lat
             self.beams[0].center_lon = sat_lon
+            self.beams[0]._calculate_ellipse_parameters() # Recalculate ellipse params
             # 15 beams around the center in a circle
             radius_deg = beam_height_deg * 4
             n_beams_side = n_beams - 1
@@ -424,6 +426,7 @@ class Satellite:
                 center_lon = sat_lon + dlon
                 self.beams[i].center_lat = center_lat
                 self.beams[i].center_lon = center_lon
+                self.beams[i]._calculate_ellipse_parameters() # Recalculate ellipse params
 
     def update_beam_loads(self, time_seconds):
         """
@@ -450,9 +453,9 @@ class Satellite:
         self.x = self.r * (math.sin(self.theta)*math.cos(self.phi) - math.cos(self.theta)*math.sin(self.phi)*math.sin(self.inclination))
         self.y = self.r * (math.sin(self.theta)*math.sin(self.phi) + math.cos(self.theta)*math.cos(self.phi)*math.sin(self.inclination))
         self.z = self.r * math.cos(self.theta)*math.cos(self.inclination)
-        self.polar_angle = self.theta  # Angle within orbital plane [radians]
-        # updating latitude and longitude after rotation [degrees]
-        self.latitude = math.asin(self.z/self.r)  # latitude corresponding to the satellite
+        
+        self.polar_angle = self.theta               # Angle within orbital plane [radians]
+        self.latitude = math.asin(self.z/self.r)   # latitude corresponding to the satellite
         # longitude corresponding to satellite
         if self.x > 0:
             self.longitude = math.atan(self.y/self.x)
@@ -469,24 +472,32 @@ class Satellite:
         self.update_beams()
 
 class Aircraft: 
-    def __init__(self, ID, latitude, longitude, altitude, env):
-        self.ID = ID
-        self.latitude = latitude  # in degrees
-        self.longitude = longitude  # in degrees
-        self.altitude = altitude  # in meters
-        self.Gr = 5 #dBi - Gain of the aircraft antenna
-        self.env = env  # Simpy environment
-        self.satellite = None
-        self.beam = None 
+    def __init__(self, env, aircraft_id, start_lat, start_lon, height, speed_kmph, direction_deg, update_interval=1):
+        self.env = env
+        self.id = aircraft_id
+        self.latitude = start_lat  # in degrees
+        self.longitude = start_lon  # in degrees
+        self.height = height  # in meters
+        self.speed_kmph = speed_kmph
+        self.direction_rad = math.radians(direction_deg) # Direction in radians (0 = East, 90 = North)
+        self.update_interval = update_interval # How often aircraft position and connection is updated
+        self.Gr = 5 #dBi - Gain of the aircraft antenna (Supervisor's value)
+
+        self.connected_satellite = None
+        self.connected_beam = None
+        self.current_snr = 0
+        self.current_latency = 0
+        self.handover_count = 0
+
+        print(f"Aircraft {self.id} initialized at ({self.latitude:.2f}, {self.longitude:.2f})")
 
     def __repr__(self):
         return 'Aircraft ID: {}, Latitude: {}, Longitude: {}, Altitude: {}'.format(
-            self.ID, self.latitude, self.longitude, self.altitude)
+            self.id, self.latitude, self.longitude, self.height)
 
     def calculate_snr(self, beam, distance_km):
+        # Supervisor's SNR Calculation Method
         # Constants
-        c = 3e8  # speed of light (m/s)
-        k = 1.38e-23  # Boltzmann's constant
         T = 290  # Noise temperature (K)
         
         # Beam parameters (assumed to be in dBm, dBi, Hz, etc.)
@@ -501,6 +512,7 @@ class Aircraft:
 
         # Free-space path loss (FSPL) in dB
         d_m = distance_km * 1000
+        if d_m == 0: return float('inf') # Avoid log(0)
         FSPL_dB = 20 * math.log10(d_m) + 20 * math.log10(f_Hz) - 147.55
 
         # Received power in dBW
@@ -513,7 +525,8 @@ class Aircraft:
         SNR_dB = Pr_dBW - N_dBW
         return SNR_dB
 
-    def scan_nearby_fast(self, earth, threshold_km=500):
+    def scan_nearby_fast(self, earth, threshold_km=1500):
+        # Supervisor's efficient scanning method using KDTree
         # Gather all beam centers and references
         beam_coords = []
         beam_refs = []
@@ -522,6 +535,10 @@ class Aircraft:
                 for beam in sat.beams:
                     beam_coords.append([beam.center_lat, beam.center_lon])
                     beam_refs.append((sat, beam))
+        
+        if not beam_refs:
+            return None, -np.inf
+
         beam_coords = np.array(beam_coords)
 
         # Build KDTree
@@ -531,47 +548,30 @@ class Aircraft:
         threshold_deg = threshold_km / 111.0
         idxs = tree.query_ball_point([self.latitude, self.longitude], r=threshold_deg)
 
-        results = []
+        best_snr = -np.inf
+        best_candidate_beam = None
+        best_candidate_sat = None
 
-        # Initialize best_snr, best_sat, best_beam based on current beam
-        if self.beam is not None and self.satellite is not None:
-            current_dist = geopy.distance.distance(
-                (self.latitude, self.longitude),
-                (self.beam.center_lat, self.beam.center_lon)
-            ).km
-            best_snr = self.calculate_snr(self.beam, current_dist)
-            best_sat = self.satellite
-            best_beam = self.beam
-        else:
-            best_snr = -np.inf
-            best_sat = None
-            best_beam = None
-
+        print(f"\n[SimTime {self.env.now:.2f}] Aircraft {self.id} scan:")
         for idx in idxs:
             sat, beam = beam_refs[idx]
-            beam_dist = geopy.distance.distance(
-                (self.latitude, self.longitude),
-                (beam.center_lat, beam.center_lon)
-            ).km
-            if beam_dist < threshold_km:
-                snr = self.calculate_snr(beam, beam_dist)
-                results.append({
-                    'type': 'beam',
-                    'sat_id': sat.ID,
-                    'beam_id': beam.id,
-                    'distance_km': beam_dist,
-                    'snr_db': snr
-                })
-                if snr > best_snr:
+            
+            # Use 3D distance for SNR calculation
+            dist_3d = self._calculate_3d_distance(sat)
+            snr = self.calculate_snr(beam, dist_3d / 1000) # distance in km
+            
+            # Check if aircraft is within the beam's elliptical footprint
+            aircraft_point = Point(self.longitude, self.latitude)
+            if beam.get_footprint_eclipse().contains(aircraft_point):
+                 print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
+                 if snr > best_snr and (beam.load < beam.capacity):
                     best_snr = snr
-                    best_sat = sat
-                    best_beam = beam
+                    best_candidate_beam = beam
+                    best_candidate_sat = sat
+            else:
+                 print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (Outside Footprint)")
 
-        # Set the best satellite and beam
-        self.satellite = best_sat
-        self.beam = best_beam
-
-        return results
+        return best_candidate_sat, best_candidate_beam, best_snr
 
     def scan_nearby(self, earth, threshold_km=500):
         results = []
@@ -655,8 +655,83 @@ class Aircraft:
         else:
             ratio = 0
 
-        return ratio, allocated, demand, beam_capacity_MB      
+        return ratio, allocated, demand, beam_capacity_MB   
+ 
+    def _update_position(self):
+        """
+        Updates aircraft's latitude and longitude based on speed and direction.
+        Uses Haversine formula for movement on a sphere.
+        """
+        # Convert speed from km/h to degrees per interval
+        distance_km_per_interval = (self.speed_kmph / 3600) * self.update_interval
+        
+    def move_and_connect_aircraft(self):
 
+        # 1. Move the aircraft
+        self._update_position()
+
+        # 2. Find the best beam using the efficient KDTree scan
+        best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance)
+
+        # 3. Manage connection and handover
+        if best_candidate_beam and best_candidate_beam != self.connected_beam:
+            # Handover or initial connection
+            if self.connected_beam:
+                # Disconnect from old beam
+                self.connected_beam.load -= 1
+                self.handover_count += 1
+                print(f"Time {self.env.now:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
+            else:
+                print(f"Time {self.env.now:.2f}: Aircraft {self.id} CONNECTED to {best_candidate_beam.id} (Initial connection)")
+
+            # Connect to new beam
+            self.connected_beam = best_candidate_beam
+            self.connected_satellite = best_candidate_sat
+            #self.connected_beam.load += 1
+            self.current_snr = best_snr
+            self.current_latency = self._calculate_latency() # Update latency
+            print(f"  >> New Status: SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms, Beam Load: {self.connected_beam.load}/{self.connected_beam.capacity}")
+
+        elif not best_candidate_beam and self.connected_beam:
+            # Lost connection
+            print(f"Time {self.env.now:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
+            #self.connected_beam.load -= 1
+            self.connected_beam = None
+            self.connected_satellite = None
+            self.current_snr = 0
+            self.current_latency = 0
+
+        elif best_candidate_beam and best_candidate_beam == self.connected_beam:
+            # Still connected to the same beam, just update SNR/latency
+            self.current_snr = best_snr
+            self.current_latency = self._calculate_latency()
+            print(f"Time {self.env.now:.2f}: Aircraft {self.id} remains connected to {self.connected_beam.id}. SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms")      
+
+     def _calculate_3d_distance(self, satellite):
+        """Calculates the 3D slant range from aircraft to satellite."""
+        # Calculate 2D distance on Earth's surface
+        dist_2d_km = geopy.distance.geodesic((self.latitude, self.longitude), 
+                                                (math.degrees(satellite.latitude), 
+                                                math.degrees(satellite.longitude))).km
+        
+        # Altitude difference
+        altitude_diff_m = (satellite.h - self.height) # Satellite altitude - aircraft height
+        
+        # Total 3D distance using Pythagorean theorem (approximation)
+        total_distance_m = math.sqrt((dist_2d_km * 1000)**2 + (altitude_diff_m)**2)
+        return total_distance_m
+
+    def _calculate_latency(self):
+        """
+        Calculates the propagation latency from the aircraft to the connected satellite.
+        """
+        if self.connected_satellite:
+            total_distance_m = self._calculate_3d_distance(self.connected_satellite)
+            # Propagation delay
+            propagation_delay = total_distance_m / Vc # Vc is speed of light in m/s
+            return propagation_delay
+        return 0           
+            
 # A single cell on earth
 class Cell:
     def __init__(self, total_x, total_y, cell_x, cell_y, users, Re=6378e3, f=20e9, bw=200e6, noise_power=1 / (1e11)):
@@ -684,18 +759,26 @@ class Cell:
         self.rejected = True  # Usefulfor applications process to show if the cell is rejected or accepted
         self.gateway = None  # (groundstation, distance)
 
-    def __repr__(self):
-        return 'Users = {}\n area = {} km^2\n longitude = {} deg\n latitude = {} deg\n pos x = {}\n pos y = {}\n pos ' \
-               'z = {}\n x position on map = {}\n y position on map = {}'.format(
-                self.users,
-                '%.2f' % (self.area / 1e6),
-                '%.2f' % math.degrees(self.longitude),
-                '%.2f' % math.degrees(self.latitude),
-                '%.2f' % self.x,
-                '%.2f' % self.y,
-                '%.2f' % self.z,
-                '%.2f' % self.map_x,
-                '%.2f' % self.map_y)
+        # Convert distance in km to angular distance in radians on Earth's surface
+        angular_distance_rad = distance_km_per_interval * 1000 / Re # Convert km to meters for Re
+
+        # Current position in radians
+        lat_rad = math.radians(self.latitude)
+        lon_rad = math.radians(self.longitude)
+
+        # Calculate new position using spherical trigonometry (Haversine formula for destination point)
+        new_lat_rad = math.asin(math.sin(lat_rad) * math.cos(angular_distance_rad) +
+                                math.cos(lat_rad) * math.sin(angular_distance_rad) * math.cos(self.direction_rad))
+        
+        new_lon_rad = lon_rad + math.atan2(math.sin(self.direction_rad) * math.sin(angular_distance_rad) * math.cos(lat_rad),
+                                           math.cos(angular_distance_rad) - math.sin(lat_rad) * math.sin(new_lat_rad))
+
+        self.latitude = math.degrees(new_lat_rad)
+        self.longitude = math.degrees(new_lon_rad)
+        
+        # Ensure longitude stays within -180 to +180
+        self.longitude = (self.longitude + 180) % 360 - 180
+
 
 # Earth consisting of cells
 class Earth:
@@ -780,53 +863,71 @@ class Earth:
                 print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
             yield env.timeout(deltaT)             
 
-    def plotMap(self, plotSat = True, plotBeams = True, path = None, bottleneck = None):
+    def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
-        #plt.figure()
         fig = plt.figure(figsize=(12, 6))
         ax = plt.axes(projection=ccrs.PlateCarree())
         ax.coastlines()
         ax.set_global()
 
+        # Generate a unique color for each orbital plane
         colors = matplotlib.cm.rainbow(np.linspace(0, 1, len(self.LEO)))
-        if self.constellationType =="OneWeb":
-            for plane, c in zip(self.LEO, colors):
-                for sat in plane.sats:
-                    lon = math.degrees(sat.longitude)
-                    lat = math.degrees(sat.latitude)
-                    if plotSat:
-                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
-                    if plotBeams:
-                        for beam in sat.beams:
-                            footprint = beam.get_footprint_eclipse()
-                            feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor='blue', facecolor='none', linewidth=0.5)
-                            ax.add_feature(feature)
-        else:
-            for plane, c in zip(self.LEO, colors):
-                for sat in plane.sats:
-                    lon = math.degrees(sat.longitude)
-                    lat = math.degrees(sat.latitude)
-                    if plotSat:
-                        ax.scatter(lon, lat, color=c, s=18, transform=ccrs.PlateCarree())
-                    if plotBeams:
-                        sat.beams[len(sat.beams) - 1].center_lon = lon
-                        sat.beams[len(sat.beams) - 1].center_lat = lat
-                        for beam in sat.beams:
-                            beam_lon = beam.center_lon
-                            beam_lat = beam.center_lat
-                            # Draw a cross at the beam center
-                            ax.plot(beam_lon, beam_lat, marker='x', markersize=2, color='blue')
         
-        # if plotSat: 
-        #     plt.legend([scat2], ['Satellites'], loc=3, prop={'size': 7})
+        # Plot satellites with color per plane
+        if plotSat:
+            plotted_sat_label = False
+            for plane, c in zip(self.LEO, colors):
+                for sat in plane.sats:
+                    lon = math.degrees(sat.longitude)
+                    lat = math.degrees(sat.latitude)
+                    # Use the color 'c' for the current plane
+                    if not plotted_sat_label:
+                        ax.scatter(lon, lat, color=c, s=10, transform=ccrs.PlateCarree(), label='Satellites')
+                        plotted_sat_label = True
+                    else:
+                        ax.scatter(lon, lat, color=c, s=10, transform=ccrs.PlateCarree())
 
-        # plt.xticks([])
-        # plt.yticks([])
-        #plt.imshow(np.log10(np.array(self.getCellUsers()).transpose() + 1), )
-        # plt.title('LEO constellation and Ground Terminals')
-        # plt.rcParams['figure.figsize'] = 36, 12  # adjust if figure is too big or small for screen
-        # plt.colorbar(fraction=0.1)  # adjust fraction to change size of color bar
-        #plt.show()
+        # Plot beams
+        if plotBeams:
+            for plane in self.LEO:
+                for sat in plane.sats:
+                    for beam in sat.beams:
+                        # Determine color and linewidth based on whether it's the selected beam
+                        is_selected = selected_beam_id and beam.id == selected_beam_id
+                        edge_color = 'red' if is_selected else 'gray'
+                        line_width = 1.5 if is_selected else 0.2
+                        alpha_val = 1.0 if is_selected else 0.3
+                        z_order = 10 if is_selected else 2 # Draw selected beam on top
+
+                        footprint = beam.get_footprint_eclipse()
+                        feature = ShapelyFeature([footprint], ccrs.PlateCarree(), edgecolor=edge_color, facecolor='none', linewidth=line_width, alpha=alpha_val)
+                        ax.add_feature(feature, zorder=z_order)
+        
+        # Plot Aircrafts and connection lines
+        if plotAircrafts and aircrafts:
+            aircraft_lons = [ac.longitude for ac in aircrafts]
+            aircraft_lats = [ac.latitude for ac in aircrafts]
+            ax.scatter(aircraft_lons, aircraft_lats, color='black', marker='x', s=50, transform=ccrs.PlateCarree(), label='Aircraft', zorder=20)
+            
+            # Optionally plot aircraft connection lines
+            plotted_conn_label = False
+            for aircraft in aircrafts:
+                if aircraft.connected_satellite:
+                    # Convert to degrees for plotting
+                    line_lons = [aircraft.longitude, math.degrees(aircraft.connected_satellite.longitude)]
+                    line_lats = [aircraft.latitude, math.degrees(aircraft.connected_satellite.latitude)]
+                    if not plotted_conn_label:
+                        ax.plot(line_lons, line_lats, color='green', linewidth=1.0, linestyle='--', transform=ccrs.Geodetic(), label='Connection', zorder=15)
+                        plotted_conn_label = True
+                    else:
+                        ax.plot(line_lons, line_lats, color='green', linewidth=1.0, linestyle='--', transform=ccrs.Geodetic(), zorder=15)
+
+
+        # Create a single legend for all plotted elements
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            plt.legend(by_label.values(), by_label.keys(), loc='lower left', prop={'size': 8})
 
     def plot3D(self):
         fig = plt.figure()
@@ -843,11 +944,15 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
-    def save_plot_at_intervals(self, env, interval=1):
+    def save_plot_at_intervals(self, env, interval=1, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
         img_count = 0
+        if not os.path.exists("simulationImages"):
+            os.makedirs("simulationImages")
         while True:
-            print(f"Saving plot {img_count} at simulation time {env.now}")
-            self.plotMap(plotSat=True)
+            print(f"\nSaving plot {img_count} at simulation time {env.now}")
+            # Get the ID of the connected beam for highlighting
+            selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
+            self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
             plt.savefig(f"simulationImages/sat_positions_{img_count}.png")
             plt.close()
             img_count += 1
@@ -884,7 +989,7 @@ def initialize(env, img_path, inputParams, movementTime):
     constellationType = inputParams['Constellation'][0]
 
     # Load earth and gateways
-    aircraft1 = Aircraft("Aircraft1", 37.7749, -122.4194, 10000, env)  # Example aircraft at San Francisco
+    aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=50000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, img_path,  constellationType, [aircraft1], inputParams, movementTime)
 
     print("Initialized Earth")
@@ -984,42 +1089,69 @@ def create_Constellation(specific_constellation, env):
     return orbital_planes
 
 
+# Global variable to store the earth instance, so Aircraft class can access it
+earth_instance = None
+
 def main():
     """
     This function is made to avoid problems with scope. everything in if __name__ = "__main__" is in global scope which
     can be an issue.
     """
+    global earth_instance # Declare as global
+
+    # Create a dummy input.csv if it doesn't exist
+    if not os.path.exists("input.csv"):
+        with open("input.csv", "w") as f:
+            f.write("Test length,Constellation\n")
+            f.write("100,OneWeb\n")
+
 
     inputParams = pd.read_csv("input.csv")
 
-
     testLength = inputParams['Test length'][0]
+    constellation_name = inputParams['Constellation'][0]
 
-    # movement time should be in the order of 10's of hours when the test type is "Rates".
-    # If the test is not 'Rates', the movement time is still kept large to avoid the constellation moving
+    # Time interval for constellation movement updates
     movementTime = 10
-    print(f"movement time: {movementTime}")
-    #10 * 3600
+    print(f"Constellation: {constellation_name}")
+    print(f"Constellation movement update interval: {movementTime} seconds")
 
     simulationTimelimit = testLength
-
-    print(f"simulation test limit: {simulationTimelimit}")
+    print(f"Simulation test length: {simulationTimelimit} seconds")
 
     env = simpy.Environment()
+    
+    # Check for population map, create a dummy one if not found
     img_path = "PopMap_500.png"
+    if not os.path.exists(img_path):
+        print(f"'{img_path}' not found. Creating a dummy 500x250 black image.")
+        Image.new('L', (500, 250)).save(img_path)
 
-    earth1= initialize(env, img_path, inputParams, movementTime)
 
-    # Start plotting process every 10 seconds
-    env.process(earth1.save_plot_at_intervals(env, interval=10))
+    earth_instance, aircraft1 = initialize(env, img_path, inputParams, movementTime)
 
-    # Start aircraft scanning process every 10 seconds (change interval as needed)
-    #env.process(aircraft1.scan_at_intervals(env, earth1, interval=10, threshold_km=500))
+    # --- Aircraft Simulation ---
+    all_aircrafts = [aircraft1] # List of all aircrafts to pass to plotting function
+
+    # Start plotting process to save map images at intervals
+    # plotAircrafts is set to True to show aircraft on the map
+    env.process(earth_instance.save_plot_at_intervals(env, interval=10, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
 
     progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
     env.run(simulationTimelimit)
     timeToSim = time.time() - startTime
+
+    print("\n\n--- Simulation Summary ---")
+    print(f"Total simulation run time: {timeToSim:.2f} seconds")
+    print(f"Aircraft '{aircraft1.id}' total handovers: {aircraft1.handover_count}")
+    if aircraft1.connected_beam:
+        print(f"Aircraft '{aircraft1.id}' final connected beam: {aircraft1.connected_beam.id}")
+        print(f"Aircraft '{aircraft1.id}' final SNR: {aircraft1.current_snr:.2f} dB")
+        print(f"Aircraft '{aircraft1.id}' final Latency: {aircraft1.current_latency*1e3:.2f} ms")
+    else:
+        print(f"Aircraft '{aircraft1.id}' ended the simulation with no connection.")
+
 
 if __name__ == '__main__':
     main()
