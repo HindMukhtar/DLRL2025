@@ -152,7 +152,7 @@ class Beam:
         self.snr = snr # Base SNR, will be adjusted for user position
         self.id = id  # Optional: unique identifier for the beam
         self.load_amplitude = 0.5 
-        self.load_frequency = 2 * math.pi / 10 
+        self.load_frequency = 2 * math.pi / 900 
         self.load_phase = random.uniform(0, 2 * math.pi)
         self.base_load = 0.5 
         
@@ -228,7 +228,7 @@ class Beam:
         current_load = self.base_load + sinusoidal_component
         
         # Ensure load stays within reasonable bounds (0-100%)
-        return max(0, min(100, current_load))
+        return current_load
     
     def update_load(self, time_seconds):
         """
@@ -489,6 +489,9 @@ class Aircraft:
         self.current_latency = 0
         self.handover_count = 0
 
+        self.total_allocated_bandwidth = 0.0  # Total allocated bandwidth (MB)
+        self.allocation_ratios = []
+
         print(f"Aircraft {self.id} initialized at ({self.latitude:.2f}, {self.longitude:.2f})")
 
     def __repr__(self):
@@ -564,7 +567,7 @@ class Aircraft:
             aircraft_point = Point(self.longitude, self.latitude)
             if beam.get_footprint_eclipse().contains(aircraft_point):
                  print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
-                 if snr > best_snr and (beam.load < beam.capacity):
+                 if snr > best_snr:
                     best_snr = snr
                     best_candidate_beam = beam
                     best_candidate_sat = sat
@@ -654,6 +657,10 @@ class Aircraft:
             ratio = allocated / demand
         else:
             ratio = 0
+
+        # Track stats for the episode
+        self.total_allocated_bandwidth += allocated
+        self.allocation_ratios.append(ratio)            
 
         return ratio, allocated, demand, beam_capacity_MB   
  
@@ -1136,7 +1143,7 @@ def main():
 
     # Start plotting process to save map images at intervals
     # plotAircrafts is set to True to show aircraft on the map
-    env.process(earth_instance.save_plot_at_intervals(env, interval=10, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
+    env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
 
     progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
@@ -1150,6 +1157,8 @@ def main():
         if aircraft.connected_beam:
             print(f"Aircraft '{aircraft.id}' final connected beam: {aircraft.connected_beam.id}")
             print(f"Aircraft '{aircraft.id}' final SNR: {aircraft.current_snr:.2f} dB")
+            print(f"Aircraft '{aircraft.id}' total allocated BW: {aircraft.total_allocated_bandwidth:.2f} MB")
+            print(f"Aircraft '{aircraft.id}' Average Allocation to demand: {sum(aircraft.allocation_ratios)/len(aircraft.allocation_ratios):.2f}")
             print(f"Aircraft '{aircraft.id}' final Latency: {aircraft.current_latency*1e3:.2f} ms")
         else:
             print(f"Aircraft '{aircraft.id}' ended the simulation with no connection.")
