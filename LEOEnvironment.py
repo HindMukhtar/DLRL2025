@@ -1164,5 +1164,6 @@ def main():
             print(f"Aircraft '{aircraft.id}' ended the simulation with no connection.")
 
 
+    
 if __name__ == '__main__':
     main()
