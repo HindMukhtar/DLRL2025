@@ -757,14 +757,14 @@ class Earth:
         for constellation in self.LEO:
             constellation.rotate(deltaT, env_time)
   
-    def step_aircraft(self, deltaT=10, threshold_km=500):
+    def step_aircraft(self, deltaT=10, threshold_km=500, folder="PPO"):
         for ac in self.aircraft:
             ac.move_and_connect_aircraft(self.LEO)
             ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
             print(f"Aircraft {ac.id} scan:")
             print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
         if self.Training == False: 
-            self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)             
+            self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft, folder=folder)             
 
     def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
@@ -908,14 +908,14 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
-    def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
+    def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None, folder = "PPO"):
         if not os.path.exists("simulationImages"):
             os.makedirs("simulationImages")
         print(f"\nSaving plot {self.img_count} at simulation time {env.now}")
         # Get the ID of the connected beam for highlighting
         selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
         self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
-        plt.savefig(f"simulationImages/PPO/sat_positions_{self.img_count}.png")
+        plt.savefig(f"simulationImages/{folder}/sat_positions_{self.img_count}.png")
         plt.close()
         self.img_count += 1          
 
