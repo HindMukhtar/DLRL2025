@@ -4,3 +4,5 @@ simpy
 matplotlib
 numba
 cartopy
+stable-baselines3
+sb3-contrib

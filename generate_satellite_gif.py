@@ -1,16 +1,26 @@
 import os
+import re
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from IPython.display import HTML, display
 
+def extract_number(filename):
+    """Extract the number from filename for proper sorting"""
+    match = re.search(r'(\d+)', filename)
+    return int(match.group(1)) if match else 0
+
 def create_gif(image_folder, output_gif, duration=500):
-    # Get all PNG files in the folder, sorted by name
-    images = [img for img in sorted(os.listdir(image_folder)) if img.endswith('.png')]
+    # Get all PNG files in the folder, sorted by number in filename
+    images = [img for img in os.listdir(image_folder) if img.endswith('.png')]
     if not images:
         print("No PNG images found in the specified folder.")
         return
+
+    # Sort by the number in the filename
+    images.sort(key=extract_number)
+    print(f"Found {len(images)} images, processing in order: {images[:5]}...")  # Show first 5
 
     frames = []
     for image_name in images:
@@ -30,11 +40,14 @@ def create_gif(image_folder, output_gif, duration=500):
 
 
 def display_frames_as_animation(image_folder, interval=40):
-    # Get all PNG files in the folder, sorted by name
-    images = [img for img in sorted(os.listdir(image_folder)) if img.endswith('.png')]
+    # Get all PNG files in the folder, sorted by number in filename
+    images = [img for img in os.listdir(image_folder) if img.endswith('.png')]
     if not images:
         print("No PNG images found in the specified folder.")
         return
+
+    # Sort by the number in the filename
+    images.sort(key=extract_number)
 
     # Load images as numpy arrays
     frames = [np.array(Image.open(os.path.join(image_folder, img))) for img in images]
@@ -47,7 +60,7 @@ def display_frames_as_animation(image_folder, interval=40):
     display(HTML(ani.to_jshtml()))
 
 if __name__ == "__main__":
-    image_folder = "simulationImages"
-    output_gif = "satellite_simulation.gif"
+    image_folder = "simulationImages/PPO"
+    output_gif = "satellite_simulation_ppo.gif"
     create_gif(image_folder, output_gif, duration=500)
-    display_frames_as_animation("simulationImages", interval=40)
+    display_frames_as_animation("simulationImages/PPO", interval=40)

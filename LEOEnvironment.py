@@ -30,7 +30,8 @@ import random
 
 receivedDataBlocks = []
 createdBlocks = []
-seed = np.random.seed(1)
+np.random.seed(42)
+random.seed(42)
 
 upGSLRates = []
 downGSLRates = []
@@ -491,6 +492,7 @@ class Aircraft:
 
         self.total_allocated_bandwidth = 0.0  # Total allocated bandwidth (MB)
         self.allocation_ratios = []
+        self.total_demand = 0 
 
         print(f"Aircraft {self.id} initialized at ({self.latitude:.2f}, {self.longitude:.2f})")
 
@@ -622,6 +624,7 @@ class Aircraft:
         num_users = random.randint(1, 10)  # 1 to 10 users
         demand_per_user = [random.uniform(0, 25) for _ in range(num_users)]  # 2–25 Mbps per user
         total_demand = sum(demand_per_user)
+        self.total_demand += (total_demand*deltaT)/8
         return (total_demand*deltaT)/8 #Total data transferred in megabytes   
 
     def update_demand(self, deltaT):
@@ -731,7 +734,7 @@ class Aircraft:
             # Still connected to the same beam, just update SNR/latency
             self.current_snr = best_snr
             self.current_latency = self._calculate_latency()
-            print(f"Time {self.env.now:.2f}: Aircraft {self.id} remains connected to {self.connected_beam.id}. SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms")      
+            print(f"Time {self.env.now:.2f}: Aircraft {self.id} remains connected to {self.connected_beam.id}. SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms")    
 
     def _calculate_3d_distance(self, satellite):
         """Calculates the 3D slant range from aircraft to satellite."""
@@ -789,10 +792,7 @@ class Aircraft:
 
 # Earth consisting of cells
 class Earth:
-    def __init__(self, env, img_path, constellation, aircraft, inputParams, deltaT, window=None):
-        pop_count_data = Image.open(img_path)
-        # total image sizes
-        print(f"Image size: {pop_count_data.size}")
+    def __init__(self, env,  constellation, aircraft, inputParams, deltaT, window=None):
         [self.total_x, self.total_y] = [1920, 906]
 
         self.total_cells = self.total_x * self.total_y
@@ -825,6 +825,8 @@ class Earth:
 
         # After moving the satellites within the constellation, the aircrafts need to scan for nearby beams 
         self.step_aircraft = env.process(self.step_aircraft(env, deltaT, threshold_km=500))
+        self.env = env
+        self.img_count = 0
 
     def set_window(self, window):  # function to change/set window for the earth
         """
@@ -869,11 +871,12 @@ class Earth:
                 #     if result['type'] == 'beam':
                 #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
                 print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
+            self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
             yield env.timeout(deltaT)             
 
     def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
-        fig = plt.figure(figsize=(12, 6))
+        fig = plt.figure(figsize=(15, 8))  # Make figure slightly wider for text
         ax = plt.axes(projection=ccrs.PlateCarree())
         ax.coastlines()
         ax.set_global()
@@ -930,12 +933,73 @@ class Earth:
                     else:
                         ax.plot(line_lons, line_lats, color='green', linewidth=1.0, linestyle='--', transform=ccrs.Geodetic(), zorder=15)
 
+            # Add aircraft metrics as text annotations
+            for i, aircraft in enumerate(aircrafts):
+                # Calculate metrics
+                avg_allocation = sum(aircraft.allocation_ratios) / len(aircraft.allocation_ratios) if aircraft.allocation_ratios else 0
+                total_handovers = aircraft.handover_count
+                total_data = aircraft.total_allocated_bandwidth
+                total_demand = aircraft.total_demand
+
+                # Position text near aircraft (offset to avoid overlap)
+                text_lon = aircraft.longitude + 10 + (i * 20)  # Offset each aircraft's text
+                text_lat = aircraft.latitude + 5
+                
+                # Create metrics text
+                metrics_text = f"Aircraft {aircraft.id}:\n" \
+                            f"Avg Allocation: {avg_allocation:.2%}\n" \
+                            f"Handovers: {total_handovers}\n" \
+                            f"Data: {total_data:.1f} MB \n" \
+                            f"Demand: {total_demand:.1f} MB"
+                
+                # Add text annotation with background box
+                ax.text(text_lon, text_lat, metrics_text,
+                    transform=ccrs.PlateCarree(),
+                    fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8, edgecolor='black'),
+                    verticalalignment='bottom',
+                    horizontalalignment='left',
+                    zorder=25)
+
+        # Create summary statistics text box
+        if aircrafts:
+            # Calculate aggregate statistics
+            total_aircraft = len(aircrafts)
+            total_handovers_all = sum(ac.handover_count for ac in aircrafts)
+            total_data_all = sum(ac.total_allocated_bandwidth for ac in aircrafts)
+            total_demand_all = sum(ac.total_demand for ac in aircrafts)
+
+            # Calculate overall average allocation ratio
+            all_ratios = []
+            for ac in aircrafts:
+                all_ratios.extend(ac.allocation_ratios)
+            overall_avg_allocation = sum(all_ratios) / len(all_ratios) if all_ratios else 0
+            
+            summary_text = f"SUMMARY STATISTICS\n" \
+                        f"Total Aircraft: {total_aircraft}\n" \
+                        f"Total Handovers: {total_handovers_all}\n" \
+                        f"Total Data Transmitted: {total_data_all:.1f} MB\n" \
+                        f"Overall Avg Allocation: {overall_avg_allocation:.2%} \n" \
+                        f"Total Demand: {total_demand_all:.1f} MB"
+
+            # Add summary text box in top-left corner
+            ax.text(0.02, 0.98, summary_text,
+                transform=ax.transAxes,
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.5", facecolor='lightblue', alpha=0.9, edgecolor='navy'),
+                verticalalignment='top',
+                horizontalalignment='left',
+                zorder=30,
+                weight='bold')
 
         # Create a single legend for all plotted elements
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         if by_label:
             plt.legend(by_label.values(), by_label.keys(), loc='lower left', prop={'size': 8})
+        
+        # Add title with timestamp
+        plt.title(f"LEO Satellite Network - Time: {self.env.now:.1f}s", fontsize=14, weight='bold')
 
     def plot3D(self):
         fig = plt.figure()
@@ -952,19 +1016,17 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
-    def save_plot_at_intervals(self, env, interval=1, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
-        img_count = 0
+    def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
+        
         if not os.path.exists("simulationImages"):
             os.makedirs("simulationImages")
-        while True:
-            print(f"\nSaving plot {img_count} at simulation time {env.now}")
-            # Get the ID of the connected beam for highlighting
-            selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
-            self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
-            plt.savefig(f"simulationImages/sat_positions_{img_count}.png")
-            plt.close()
-            img_count += 1
-            yield env.timeout(interval)        
+        print(f"\nSaving plot {self.img_count} at simulation time {env.now}")
+        # Get the ID of the connected beam for highlighting
+        selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
+        self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
+        plt.savefig(f"simulationImages/Baseline/sat_positions_{self.img_count}.png")
+        plt.close()
+        self.img_count += 1      
 
     def __repr__(self):
         return 'total divisions in x = {}\n total divisions in y = {}\n total cells = {}\n window of operation ' \
@@ -981,7 +1043,7 @@ class Earth:
 ###############################################################################
 
 
-def initialize(env, img_path, inputParams, movementTime):
+def initialize(env, inputParams, movementTime):
     """
     Initializes an instance of the earth with cells from a population map and gateways from a csv file.
     During initialisation, several steps are performed to prepare for simulation:
@@ -998,7 +1060,7 @@ def initialize(env, img_path, inputParams, movementTime):
 
     # Load earth and gateways
     aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=80000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
-    earth = Earth(env, img_path,  constellationType, [aircraft1], inputParams, movementTime)
+    earth = Earth(env, constellationType, [aircraft1], inputParams, movementTime)
 
     print("Initialized Earth")
     print(earth)
@@ -1128,22 +1190,15 @@ def main():
     print(f"Simulation test length: {simulationTimelimit} seconds")
 
     env = simpy.Environment()
-    
-    # Check for population map, create a dummy one if not found
-    img_path = "PopMap_500.png"
-    if not os.path.exists(img_path):
-        print(f"'{img_path}' not found. Creating a dummy 500x250 black image.")
-        Image.new('L', (500, 250)).save(img_path)
 
-
-    earth_instance = initialize(env, img_path, inputParams, movementTime)
+    earth_instance = initialize(env, inputParams, movementTime)
 
     # --- Aircraft Simulation ---
     all_aircrafts = earth_instance.aircraft # List of all aircrafts to pass to plotting function
 
     # Start plotting process to save map images at intervals
     # plotAircrafts is set to True to show aircraft on the map
-    env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
+    #env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
 
     progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
