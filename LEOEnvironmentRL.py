@@ -17,7 +17,6 @@ from shapely.geometry.polygon import Polygon
 from cartopy.feature import ShapelyFeature
 import matplotlib.patches as mpatches
 from shapely.geometry import box
-from shapely.geometry import Polygon
 from shapely.affinity import scale, rotate, translate
 from scipy.spatial import KDTree
 import random
