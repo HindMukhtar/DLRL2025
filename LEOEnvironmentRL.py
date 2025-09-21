@@ -20,7 +20,6 @@ from shapely.geometry import box
 from shapely.geometry import Polygon
 from shapely.affinity import scale, rotate, translate
 from scipy.spatial import KDTree
-import numpy as np
 import random
 
 
