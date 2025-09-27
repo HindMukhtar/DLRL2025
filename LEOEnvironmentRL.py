@@ -20,6 +20,7 @@ from shapely.geometry import box
 from shapely.affinity import scale, rotate, translate
 from scipy.spatial import KDTree
 import random
+import csv
 
 
 ###############################################################################
@@ -469,17 +470,54 @@ class Satellite:
             self.longitude = 0
         self.update_beams()
 
+
+
+def load_route_from_csv(filename, skip_rows=10):
+    """
+    Loads the aircraft route from a CSV file, skipping the first and last N rows.
+    Returns a list of dicts with keys: 'lat', 'lon', 'speed_mph'
+    """
+    route = []
+    # Try utf-8-sig first, fallback to latin1 if error
+    try:
+        with open(filename, newline='', encoding='utf-8-sig') as csvfile:
+            reader = list(csv.DictReader(csvfile))
+    except UnicodeDecodeError:
+        with open(filename, newline='', encoding='latin1') as csvfile:
+            reader = list(csv.DictReader(csvfile))
+    # Ignore first and last skip_rows
+    data = reader[skip_rows:-skip_rows]
+    for row in data:
+        try:
+            lat = float(row['Latitude'])
+            lon = float(row['Longitude'])
+            speed = float(row['mph'])
+            route.append({'lat': lat, 'lon': lon, 'speed_mph': speed})
+        except Exception:
+            continue  # skip malformed rows
+    return route
+
+
 class Aircraft: 
-    def __init__(self, env, aircraft_id, start_lat, start_lon, height, speed_kmph, direction_deg, update_interval=1):
+    def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1):
         self.env = env
         self.id = aircraft_id
-        self.latitude = start_lat  # in degrees
-        self.longitude = start_lon  # in degrees
         self.height = height  # in meters
-        self.speed_kmph = speed_kmph
-        self.direction_rad = math.radians(direction_deg) # Direction in radians (0 = East, 90 = North)
-        self.update_interval = update_interval # How often aircraft position and connection is updated
-        self.Gr = 5 #dBi - Gain of the aircraft antenna (Supervisor's value)
+        self.update_interval = update_interval
+        self.Gr = 5 #dBi
+
+        self.route = route or []
+        self.route_index = 0
+
+        # Initialize position from route if available
+        if self.route:
+            self.latitude = self.route[0]['lat']
+            self.longitude = self.route[0]['lon']
+            self.speed_kmph = self.route[0]['speed_mph'] * 1.60934
+        else:
+            self.latitude = 0
+            self.longitude = 0
+            self.speed_kmph = 0
 
         self.connected_satellite = None
         self.connected_beam = None
@@ -649,35 +687,21 @@ class Aircraft:
  
     def _update_position(self):
         """
-        Updates aircraft's latitude and longitude based on speed and direction.
-        Uses Haversine formula for movement on a sphere.
+        Updates aircraft's latitude, longitude, and speed from the route.
+        If using a real route, just step to the next point.
         """
-        # Convert speed from km/h to degrees per interval
-        distance_km_per_interval = (self.speed_kmph / 3600) * self.update_interval
-            # Convert distance in km to angular distance in radians on Earth's surface
-        angular_distance_rad = distance_km_per_interval * 1000 / Re # Convert km to meters for Re
-
-        # Current position in radians
-        lat_rad = math.radians(self.latitude)
-        lon_rad = math.radians(self.longitude)
-
-        # Calculate new position using spherical trigonometry (Haversine formula for destination point)
-        new_lat_rad = math.asin(math.sin(lat_rad) * math.cos(angular_distance_rad) +
-                                math.cos(lat_rad) * math.sin(angular_distance_rad) * math.cos(self.direction_rad))
-        
-        new_lon_rad = lon_rad + math.atan2(math.sin(self.direction_rad) * math.sin(angular_distance_rad) * math.cos(lat_rad),
-                                           math.cos(angular_distance_rad) - math.sin(lat_rad) * math.sin(new_lat_rad))
-
-        self.latitude = math.degrees(new_lat_rad)
-        self.longitude = math.degrees(new_lon_rad)
-        
-        # Ensure longitude stays within -180 to +180
-        self.longitude = (self.longitude + 180) % 360 - 180   
+        if self.route and self.route_index < len(self.route):
+            point = self.route[self.route_index]
+            self.latitude = point['lat']
+            self.longitude = point['lon']
+            self.speed_kmph = point['speed_mph'] * 1.60934  # mph to km/h
+            self.route_index += 1  # Move to next point for next update
+        # If not using a route, you could implement the old logic here (with direction), but skip for real route.
 
     def move_and_connect_aircraft(self, constellation):
 
         # 1. Move the aircraft
-        #self._update_position() # we wont move the aircraft for now to simplify the simulation
+        self._update_position() # we wont move the aircraft for now to simplify the simulation
 
         # 2. Find the best beam using the efficient KDTree scan
         self.scan_nearby_fast(constellation)  
@@ -808,7 +832,9 @@ class Earth:
         if plotAircrafts and aircrafts:
             aircraft_lons = [ac.longitude for ac in aircrafts]
             aircraft_lats = [ac.latitude for ac in aircrafts]
-            ax.scatter(aircraft_lons, aircraft_lats, color='black', marker='x', s=50, transform=ccrs.PlateCarree(), label='Aircraft', zorder=20)
+            # ax.scatter(aircraft_lons, aircraft_lats, color='black', marker='x', s=50, transform=ccrs.PlateCarree(), label='Aircraft', zorder=20)
+            for lon, lat in zip(aircraft_lons, aircraft_lats):
+                ax.text(lon, lat, '✈', fontsize=18, color='black', transform=ccrs.PlateCarree(), ha='center', va='center', zorder=20)
             
             # Optionally plot aircraft connection lines
             plotted_conn_label = False
@@ -948,7 +974,9 @@ def initialize(env, inputParams, movementTime):
     constellationType = inputParams['Constellation'][0]
 
     # Load earth and gateways
-    aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=80000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
+    route = load_route_from_csv('route.csv', skip_rows=10)
+    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10)
+    # aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=8000000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, constellationType, [aircraft1], inputParams, movementTime)
 
     print("Initialized Earth")
