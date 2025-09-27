@@ -21,7 +21,7 @@ class LEOEnv(gym.Env):
     Gymnasium environment wrapper for the LEO satellite handover simulation.
     """
 
-    def __init__(self, input_csv="input.csv", movementTime=20,  max_steps=15):
+    def __init__(self, input_csv="input.csv", movementTime=20):
         super(LEOEnv, self).__init__()
 
         # We'll set a placeholder action space, but update it dynamically
@@ -35,7 +35,6 @@ class LEOEnv(gym.Env):
         self.input_csv = input_csv
         self.movementTime = movementTime
         self.deltaT = movementTime
-        self.max_steps = max_steps
 
         self.env = None
         self.earth = None
@@ -142,7 +141,8 @@ class LEOEnv(gym.Env):
         obs = self._get_obs()
         base_reward = self._get_reward()
         final_reward = base_reward + reward_penalty  # Add penalty
-        terminated = self.current_step >= self.max_steps
+        terminated = 0
+        print(f"Current simulation step: {self.current_step}")
         truncated = False
         info = {
             "available_beams": self.available_beams,
@@ -229,7 +229,7 @@ env.env.earth.Training = False
 
 done = False
 step_count = 0
-while not done and step_count < 15:
+while not done:
     print(f"\n--- Step {step_count} ---")
     
     # Get current mask
@@ -241,7 +241,7 @@ while not done and step_count < 15:
     print(f"Manually predicted valid action: {action}")
     print(f"Action is valid: {mask[action]}")
     
-    obs, reward, done, truncated, info = env.step(action)
+    obs, reward, done, truncated, info = env.env.step(action)
     step_count += 1
 
 
