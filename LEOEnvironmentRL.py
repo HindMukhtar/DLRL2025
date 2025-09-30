@@ -160,7 +160,7 @@ class Beam:
 
         if constellation == 'OneWeb': 
             #self.max_capacity = 7.2 #Gbps 
-            self.max_capacity = 0.5 #Gbps reduce for now as we only have a single agent 
+            self.max_capacity = 0.48 #Gbps reduce for now as we only have a single agent 
             self.capacity = self.max_capacity*self.load
             self.max_ds_speed = 150 #Mbps 
             self.max_us_speed = 30 #Mbps 
@@ -313,8 +313,9 @@ class Satellite:
         beam_height_km = side_km / n_beams  # ≈ 81.9 km
 
         deg_per_km = 1 / 111  # Approximate conversion
-        beam_width_deg = beam_width_km * deg_per_km
-        beam_height_deg = beam_height_km * deg_per_km
+        # Add tolerance to beam size
+        beam_width_deg = (beam_width_km + 100) * deg_per_km
+        beam_height_deg = (beam_height_km + 50) * deg_per_km
 
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
@@ -479,30 +480,37 @@ def load_route_from_csv(filename, skip_rows=10):
     """
     route = []
     # Try utf-8-sig first, fallback to latin1 if error
+    print("Loading flight route from csv")
     try:
         with open(filename, newline='', encoding='utf-8-sig') as csvfile:
             reader = list(csv.DictReader(csvfile))
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as e:
+        print(f"UTF-8 decoding error: {e}. Trying latin1 encoding.")
         with open(filename, newline='', encoding='latin1') as csvfile:
             reader = list(csv.DictReader(csvfile))
     # Ignore first and last skip_rows
     data = reader[skip_rows:-skip_rows]
+    print(data)
     for row in data:
         try:
             lat = float(row['Latitude'])
             lon = float(row['Longitude'])
             speed = float(row['mph'])
-            route.append({'lat': lat, 'lon': lon, 'speed_mph': speed})
-        except Exception:
+            altitude = float(row['feet'].replace(',', ''))  # Ensure altitude is float
+            time = pd.to_datetime(row['Time (EDT)'], format="%a %I:%M:%S %p")  # Time in seconds
+            route.append({'lat': lat, 'lon': lon, 'speed_mph': speed, 'alt': altitude, 'time': time})
+        except Exception as e:
+            print(f"Skipping malformed row due to error: {e}")
             continue  # skip malformed rows
-    return route
+    route_duration = (route[-1]['time'] - route[0]['time']).total_seconds()
+    return route, route_duration
 
 
 class Aircraft: 
     def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1):
+        self.deltaT = 1 
         self.env = env
         self.id = aircraft_id
-        self.height = height  # in meters
         self.update_interval = update_interval
         self.Gr = 5 #dBi
 
@@ -513,11 +521,13 @@ class Aircraft:
         if self.route:
             self.latitude = self.route[0]['lat']
             self.longitude = self.route[0]['lon']
+            self.height = self.route[0]['alt'] * 0.3048  # Convert feet to meters
             self.speed_kmph = self.route[0]['speed_mph'] * 1.60934
         else:
             self.latitude = 0
             self.longitude = 0
             self.speed_kmph = 0
+            self.height = height  # in meters
 
         self.connected_satellite = None
         self.connected_beam = None
@@ -667,11 +677,13 @@ class Aircraft:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
             beam_capacity_MB = self.connected_beam.capacity * 125 * deltaT  # MB for this timestep
+            shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Gbps
         else:
             beam_capacity_MB = 0
+            shannon_capacity = 0 
 
-        # Throughput is the minimum of demand and available capacity
-        allocated = min(demand, beam_capacity_MB)
+        # Allocated bandwidth is bounded by shannon's capacity and beam capacity
+        allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
 
         # Avoid division by zero
         if demand > 0:
@@ -684,7 +696,18 @@ class Aircraft:
         self.allocation_ratios.append(ratio)            
 
         return ratio, allocated, demand, beam_capacity_MB   
- 
+
+    def time_between_points(self, lat1, lon1, lat2, lon2, speed_kmph):
+        # Calculate distance in kilometers
+        coords_1 = (lat1, lon1)
+        coords_2 = (lat2, lon2)
+        distance_km = geopy.distance.geodesic(coords_1, coords_2).km
+        # Calculate time in hours
+        if speed_kmph == 0:
+            return float('inf')  # Avoid division by zero
+        time_hours = distance_km / speed_kmph
+        return time_hours
+     
     def _update_position(self):
         """
         Updates aircraft's latitude, longitude, and speed from the route.
@@ -692,19 +715,29 @@ class Aircraft:
         """
         if self.route and self.route_index < len(self.route):
             point = self.route[self.route_index]
+            prevpoint = self.route[self.route_index - 1] if self.route_index > 0 else point
             self.latitude = point['lat']
             self.longitude = point['lon']
+            self.height = point['alt'] * 0.3048  # feet to meters
             self.speed_kmph = point['speed_mph'] * 1.60934  # mph to km/h
             self.route_index += 1  # Move to next point for next update
+            print(f"route index {self.route_index} of {len(self.route)}")
+            deltaT = self.time_between_points(prevpoint['lat'], prevpoint['lon'], point['lat'], point['lon'], self.speed_kmph)
+            deltaT_seconds = deltaT * 3600 if deltaT and deltaT > 0 else 1  # At least 1 second
+            print(f"new posotion {self.longitude} {self.latitude} speed {self.speed_kmph} deltaT {deltaT_seconds}")
+            return deltaT_seconds
         # If not using a route, you could implement the old logic here (with direction), but skip for real route.
 
     def move_and_connect_aircraft(self, constellation):
 
         # 1. Move the aircraft
-        self._update_position() # we wont move the aircraft for now to simplify the simulation
+        deltaT = self._update_position()
+        self.deltaT - deltaT 
 
         # 2. Find the best beam using the efficient KDTree scan
         self.scan_nearby_fast(constellation)  
+
+        return deltaT 
 
     def _calculate_3d_distance(self, satellite):
         """Calculates the 3D slant range from aircraft to satellite."""
@@ -734,7 +767,9 @@ class Aircraft:
 
 # Earth consisting of cells
 class Earth:
-    def __init__(self, env, constellation, aircraft, inputParams, deltaT, window=None):
+    def __init__(self, env, constellation, aircraft, window=None):
+        self.deltaT = 0 
+        
         [self.total_x, self.total_y] = [1920, 906]
 
         self.total_cells = self.total_x * self.total_y
@@ -779,9 +814,10 @@ class Earth:
         for constellation in self.LEO:
             constellation.rotate(deltaT, env_time)
   
-    def step_aircraft(self, deltaT=10, threshold_km=500, folder="PPO"):
+    def step_aircraft(self, folder="PPO"):
         for ac in self.aircraft:
-            ac.move_and_connect_aircraft(self.LEO)
+            deltaT = ac.move_and_connect_aircraft(self.LEO)
+            self.deltaT = deltaT 
             ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
             print(f"Aircraft {ac.id} scan:")
             print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
@@ -958,7 +994,7 @@ class Earth:
 ###############################################################################
 
 
-def initialize(env, inputParams, movementTime):
+def initialize(env, constellationType, route):
     """
     Initializes an instance of the earth with cells from a population map and gateways from a csv file.
     During initialisation, several steps are performed to prepare for simulation:
@@ -971,13 +1007,10 @@ def initialize(env, inputParams, movementTime):
         - Buffers and processes are created on all GTs and satellites used for sending the blocks throughout the network
     """
 
-    constellationType = inputParams['Constellation'][0]
-
     # Load earth and gateways
-    route = load_route_from_csv('route.csv', skip_rows=10)
     aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10)
     # aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=8000000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
-    earth = Earth(env, constellationType, [aircraft1], inputParams, movementTime)
+    earth = Earth(env, constellationType, [aircraft1])
 
     print("Initialized Earth")
     print(earth)
@@ -1101,19 +1134,19 @@ def main():
     print(f"Simulation test length: {simulationTimelimit} seconds")
 
     env = simpy.Environment()
-
-    earth_instance = initialize(env, inputParams, movementTime)
+    route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
+    earth_instance = initialize(env, constellation_name, route)
 
     # --- Aircraft Simulation ---
     all_aircrafts = earth_instance.aircraft # List of all aircrafts to pass to plotting function
 
     # Start plotting process to save map images at intervals
     # plotAircrafts is set to True to show aircraft on the map
-    env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
+    #env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
 
-    progress = env.process(simProgress(simulationTimelimit, env))
+    #progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
-    env.run(simulationTimelimit)
+    env.run(route_duration)
     timeToSim = time.time() - startTime
 
     for aircraft in all_aircrafts:

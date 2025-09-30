@@ -2,7 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import simpy
-from LEOEnvironmentRL import initialize  # Use RL version
+from LEOEnvironmentRL import initialize, load_route_from_csv  # Use RL version
 import pandas as pd
 import os
 from stable_baselines3 import DQN
@@ -21,7 +21,7 @@ class LEOEnv(gym.Env):
     Gymnasium environment wrapper for the LEO satellite handover simulation.
     """
 
-    def __init__(self, input_csv="input.csv", movementTime=20,  max_steps=15):
+    def __init__(self, constellation_name, route):
         super(LEOEnv, self).__init__()
 
         # We'll set a placeholder action space, but update it dynamically
@@ -32,10 +32,9 @@ class LEOEnv(gym.Env):
         high = np.array([90, 180, 100, 100, 1000], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
-        self.input_csv = input_csv
-        self.movementTime = movementTime
-        self.deltaT = movementTime
-        self.max_steps = max_steps
+        self.constellation = constellation_name 
+        self.route = route 
+        self.deltaT = 1
 
         self.env = None
         self.earth = None
@@ -51,10 +50,9 @@ class LEOEnv(gym.Env):
         self._setup_simulation()
 
     def _setup_simulation(self):
-        inputParams = pd.read_csv(self.input_csv)
 
         self.env = simpy.Environment()
-        self.earth = initialize(self.env, inputParams, self.movementTime)
+        self.earth = initialize(self.env, self.constellation, self.route)
         self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
         self.current_step = 0
 
@@ -128,9 +126,10 @@ class LEOEnv(gym.Env):
             reward_penalty = -1.0
 
         # Advance simulation
-        self.earth.advance_constellation(self.deltaT, self.env.now)
-        self.earth.step_aircraft(self.deltaT, folder="DQN")
-        self.env.run(until=self.env.now + self.deltaT)
+        self.earth.step_aircraft(folder="DQN")
+        self.earth.advance_constellation(self.earth.deltaT, self.env.now)
+        
+        self.env.run(until=self.env.now + self.earth.deltaT)
         self.current_step += 1
 
         # Update available beams for next step
@@ -142,8 +141,12 @@ class LEOEnv(gym.Env):
         obs = self._get_obs()
         base_reward = self._get_reward()
         final_reward = base_reward + reward_penalty  # Add penalty
-        terminated = self.current_step >= self.max_steps
-        truncated = False
+        print(f"Current simulation step: {self.current_step}")
+        terminated = False 
+        truncated = False 
+        if self.current_step >= len(self.route) - 1:
+            terminated = True
+        
         info = {
             "available_beams": self.available_beams,
             "action_mask": self.action_mask  # Return mask in info
@@ -200,7 +203,10 @@ def predict_valid_action(model, obs, mask):
 # %% 
 
 # Create the environment
-env = LEOEnv()
+inputParams = pd.read_csv("input.csv")
+constellation_name = inputParams['Constellation'][0]
+route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
+env = LEOEnv(constellation_name, route)
 env = ActionMasker(env, mask_fn)
 
 # Create the DQN agent
@@ -240,7 +246,7 @@ for step in range(total_timesteps):
         obs, info = env.reset()
 
 # Save the trained model
-model.save("handover_ppo_agent")
+model.save("handover_dqn_agent")
 
 
 # Evaluation with debugging
@@ -253,7 +259,7 @@ env.env.earth.Training = False
 
 done = False
 step_count = 0
-while not done and step_count < 15:
+while not done and step_count < route_duration:
     print(f"\n--- Step {step_count} ---")
     
     # Get current mask
