@@ -23,7 +23,8 @@ from shapely.affinity import scale, rotate, translate
 from scipy.spatial import KDTree
 import numpy as np
 import random
-
+import gymnasium as gym
+from gymnasium import spaces
 
 ###############################################################################
 #################################    Simpy    #################################
@@ -575,17 +576,19 @@ class Aircraft:
         SNR_dB = Pr_dBW - N_dBW
         return SNR_dB
 
-    def scan_nearby_fast(self, earth, threshold_km=1500):
-        # Supervisor's efficient scanning method using KDTree
-        # Gather all beam centers and references
+    def scan_nearby_fast(self, constellation, threshold_km=1500):
+        """
+        Returns a list of all beams where the aircraft is inside the footprint.
+        Each entry is a dict with beam, satellite, SNR, load, capacity, etc.
+        """
         beam_coords = []
         beam_refs = []
-        for plane in earth.LEO:
+        for plane in constellation:
             for sat in plane.sats:
                 for beam in sat.beams:
                     beam_coords.append([beam.center_lat, beam.center_lon])
                     beam_refs.append((sat, beam))
-        
+
         if not beam_refs:
             return None, -np.inf
 
@@ -602,7 +605,7 @@ class Aircraft:
         best_candidate_beam = None
         best_candidate_sat = None
 
-        print(f"\n[SimTime {self.env.now:.2f}] Aircraft {self.id} scan:")
+        #print(f"\n[SimTime {self.env.now:.2f}] Aircraft {self.id} scan:")
         for idx in idxs:
             sat, beam = beam_refs[idx]
             
@@ -613,13 +616,13 @@ class Aircraft:
             # Check if aircraft is within the beam's elliptical footprint
             aircraft_point = Point(self.longitude, self.latitude)
             if beam.get_footprint_eclipse().contains(aircraft_point):
-                 print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
+                 #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
                  if snr > best_snr:
                     best_snr = snr
                     best_candidate_beam = beam
                     best_candidate_sat = sat
-            else:
-                 print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (Outside Footprint)")
+            #else:
+                 #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (Outside Footprint)")
 
         return best_candidate_sat, best_candidate_beam, best_snr
 
@@ -652,13 +655,13 @@ class Aircraft:
         return results
 
     def scan_at_intervals(self, env, earth, interval=10, threshold_km=500):
-        while True:
-            scan_results = self.scan_nearby_fast(earth, threshold_km=threshold_km)
-            print(f"\n[SimTime {env.now}] Aircraft {self.ID} scan:")
-            for result in scan_results:
-                if result['type'] == 'beam':
-                    print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
-            yield env.timeout(interval)
+        #while True:
+        scan_results = self.scan_nearby_fast(earth, threshold_km=threshold_km)
+        print(f"\n[SimTime {env.now}] Aircraft {self.ID} scan:")
+        for result in scan_results:
+            if result['type'] == 'beam':
+                print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
+            #yield env.timeout(interval)
 
     def get_demand_at_time(self, deltaT):
         """
@@ -746,21 +749,21 @@ class Aircraft:
             return deltaT_seconds
         # If not using a route, you could implement the old logic here (with direction), but skip for real route.
 
-    def move_and_connect_aircraft(self):
+    def move_and_connect_aircraft(self, earth_instance):
 
         # 1. Move the aircraft
         deltaT = self._update_position() 
         self.deltaT = deltaT
 
         # 2. Find the best beam using the efficient KDTree scan
-        best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance)
+        best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance.LEO)
 
         # 3. Manage connection and handover
         if best_candidate_beam and best_candidate_beam != self.connected_beam:
             # Handover or initial connection
             if self.connected_beam:
                 # Disconnect from old beam
-                self.connected_beam.load -= 1
+                #self.connected_beam.load -= 1
                 self.handover_count += 1
                 print(f"Time {self.env.now:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
             else:
@@ -780,7 +783,7 @@ class Aircraft:
             #self.connected_beam.load -= 1
             self.connected_beam = None
             self.connected_satellite = None
-            self.current_snr = 0
+            self.current_snr = float('-inf')
             self.current_latency = 0
 
         elif best_candidate_beam and best_candidate_beam == self.connected_beam:
@@ -849,12 +852,10 @@ class Earth:
         self.aircraft = aircraft 
 
         # After moving the satellites within the constellation, the aircrafts need to scan for nearby beams 
-        self.step_aircraft = env.process(self.step_aircraft(env, threshold_km=500))
+        #self.step_aircraft = env.process(self.step_aircraft(env, threshold_km=500))
 
         # Simpy process for handling moving the constellation and the satellites within the constellation
         #self.moveConstellation = env.process(self.moveConstellation(env, 10))
-
-
         self.env = env
         self.img_count = 0
 
@@ -868,44 +869,28 @@ class Earth:
         self.windowy = ((int)((0.5 - window[3] / 180) * self.total_y), (int)((0.5 - window[2] / 180) * self.total_y))
 
 
-    def moveConstellation(self, env, deltaT=10):
-        # env 
-        """
-        Simpy process function:
-
-        Moves the constellations in terms of the Earth's rotation and moves the satellites within the constellations.
-        The movement is based on the time that has passed since last constellation movement and is defined by the
-        "deltaT" variable.
-
-        After the satellites have been moved a process of re-linking all links, both GSLs and ISLs, is conducted where
-        the paths for all blocks are re-made, the blocks are moved (if necessary) to the correct buffers, and all
-        processes managing the send-buffers are checked to ensure they will still work correctly.
-        """
-       # while True:
-    
-            # rotate constellation and satellites
+    def advance_constellation(self, deltaT, env_time):
+        # rotate constellation and satellites
         for constellation in self.LEO:
-            constellation.rotate(deltaT, env.now)
-            #yield env.timeout(deltaT)   
+            constellation.rotate(deltaT, env_time)
 
     def step_aircraft(self, env, threshold_km=500):
         """
         SimPy process: At each interval, all aircraft scan, update demand, and calculate allocation.
         """
-        while True:
-            for ac in self.aircraft:
-                #scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
-                deltaT = ac.move_and_connect_aircraft()  # Move aircraft and manage connections
-                self.deltaT = deltaT
-                self.moveConstellation(self.env, deltaT)
-                ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
-                print(f"\n[SimTime {env.now}] Aircraft {ac.id} scan:")
-                # for result in scan_results:
-                #     if result['type'] == 'beam':
-                #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
-                print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
-            self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
-            yield env.timeout(deltaT)             
+        #while True:
+        for ac in self.aircraft:
+            #scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
+            deltaT = ac.move_and_connect_aircraft(self)  # Move aircraft and manage connections
+            self.deltaT = deltaT
+            ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
+            print(f"\n[SimTime {env.now}] Aircraft {ac.id} scan:")
+            # for result in scan_results:
+            #     if result['type'] == 'beam':
+            #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
+            print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
+        self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
+            #yield env.timeout(deltaT)             
 
     def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
@@ -1052,17 +1037,20 @@ class Earth:
         plt.show()
 
     def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
-        
-        if not os.path.exists("simulationImages"):
-            os.makedirs("simulationImages")
+        save_dir = "simulationImages/Baseline"
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
         print(f"\nSaving plot {self.img_count} at simulation time {env.now}")
-        # Get the ID of the connected beam for highlighting
         selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
         self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
-        plt.savefig(f"simulationImages/Baseline/sat_positions_{self.img_count}.png")
+        filename = os.path.join(save_dir, f"sat_positions_{self.img_count}.png")
+        try:
+            plt.savefig(filename)
+        except Exception as e:
+            print(f"Error saving plot: {e} (filename: {filename})")
         plt.close()
-        self.img_count += 1      
-
+        self.img_count += 1 
+    
     def __repr__(self):
         return 'total divisions in x = {}\n total divisions in y = {}\n total cells = {}\n window of operation ' \
                '(longitudes) = {}\n window of operation (latitudes) = {}'.format(
@@ -1098,7 +1086,6 @@ def initialize(env, constellationType, route):
 
     print("Initialized Earth")
     print(earth)
-    print()
 
     return earth
 
@@ -1192,9 +1179,139 @@ def create_Constellation(specific_constellation, env):
 
     return orbital_planes
 
+class LEOEnv(gym.Env):
+    """
+    Gymnasium environment wrapper for the LEO satellite handover simulation.
+    """
 
-# Global variable to store the earth instance, so Aircraft class can access it
-earth_instance = None
+    def __init__(self, constellation_name, route):
+        super(LEOEnv, self).__init__()
+
+        # We'll set a placeholder action space, but update it dynamically
+        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
+
+        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
+        low = np.array([-90, -180, -100, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 100, 100, 1000], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
+        self.constellation = constellation_name 
+        self.route = route 
+        self.deltaT = 1
+
+        self.env = None
+        self.earth = None
+        self.aircraft = None
+        self.current_step = 0
+
+        self.available_beams = []  # List of available beams for current step
+
+        np.random.seed(42)
+        random.seed(42)
+
+        self._setup_simulation()
+
+    def _setup_simulation(self):
+
+        self.env = simpy.Environment()
+        self.earth = initialize(self.env, self.constellation, self.route)
+        self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
+        self.current_step = 0
+
+        # Build global beam id list and mapping
+        self.all_beam_ids = []
+        self.beam_id_to_obj = {}
+        for plane in self.earth.LEO:
+            for sat in plane.sats:
+                for beam in sat.beams:
+                    self.all_beam_ids.append(beam.id)
+                    self.beam_id_to_obj[beam.id] = beam
+
+        self.action_space = spaces.Discrete(len(self.all_beam_ids))
+
+        # Find available beams for the initial state
+        self.available_beams = self._get_available_beams()
+
+    def _get_available_beams(self):
+        # Returns a list of candidate beams (dicts) from scan_nearby_fast
+        return self.aircraft.scan_nearby_fast(self.earth.LEO)
+    
+    def _get_action_mask(self):
+        mask = np.zeros(len(self.all_beam_ids), dtype=bool)
+        available_ids = [b['beam'].id for b in self.available_beams]
+        for i, beam_id in enumerate(self.all_beam_ids):
+            if beam_id in available_ids:
+                mask[i] = True
+        return mask    
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        np.random.seed(42)
+        random.seed(42)
+        self._setup_simulation()
+        obs = self._get_obs()
+        info = {
+            "available_beams": self.available_beams,
+        }
+        return obs, info
+
+    def step(self):
+
+        # Advance simulation
+        self.earth.step_aircraft(self.env)
+        self.earth.advance_constellation(self.earth.deltaT, self.env.now)
+        
+        self.env.run(until=self.env.now + self.earth.deltaT)
+        self.current_step += 1
+
+        # Update available beams for next step
+        self.available_beams = self._get_available_beams()
+
+        obs = self._get_obs()
+        base_reward = self._get_reward()
+        final_reward = base_reward 
+        print(f"Current simulation step: {self.current_step}")
+        terminated = False 
+        truncated = False 
+        if self.current_step >= len(self.route) - 1:
+            terminated = True
+        
+        info = {
+            "available_beams": self.available_beams,
+        }
+
+        print(f"final reward: {final_reward}, base reward: {base_reward}")
+
+        return obs, final_reward, terminated, truncated, info
+
+    def _get_obs(self):
+        ac = self.aircraft
+        lat = ac.latitude
+        lon = ac.longitude
+        alt = ac.height
+        snr = ac.current_snr if ac.current_snr is not None else 0
+        load = ac.connected_beam.load if ac.connected_beam else 0
+        cap = ac.connected_beam.capacity if ac.connected_beam else 0
+        handovers = ac.handover_count
+        total_allocated_bw = ac.total_allocated_bandwidth 
+        if ac.allocation_ratios: 
+            allocation_to_demand = ac.allocation_ratios[-1]
+        else: 
+            allocation_to_demand = 0 
+        return np.array([lat, lon, alt, snr, load, cap, handovers, total_allocated_bw, allocation_to_demand], dtype=np.float32)
+
+    def _get_reward(self):
+        if self.aircraft.allocation_ratios:
+            return self.aircraft.allocation_ratios[-1]
+        return 0.0
+
+    def render(self):
+        if self.earth:
+            self.earth.plotMap(plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=[self.aircraft])
+
+    def close(self): 
+        pass
+
 
 def main():
     """
