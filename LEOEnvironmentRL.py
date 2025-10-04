@@ -602,7 +602,7 @@ class Aircraft:
             dist_3d = self._calculate_3d_distance(sat)
             snr = self.calculate_snr(beam, dist_3d / 1000) # distance in km
             aircraft_point = Point(self.longitude, self.latitude)
-            if beam.get_footprint_eclipse().contains(aircraft_point):
+            if beam.get_footprint_eclipse().covers(aircraft_point):
                 candidates.append({
                     'sat': sat,
                     'beam': beam,
@@ -732,7 +732,7 @@ class Aircraft:
 
         # 1. Move the aircraft
         deltaT = self._update_position()
-        self.deltaT - deltaT 
+        self.deltaT = deltaT 
 
         # 2. Find the best beam using the efficient KDTree scan
         self.scan_nearby_fast(constellation)  

@@ -615,7 +615,7 @@ class Aircraft:
             
             # Check if aircraft is within the beam's elliptical footprint
             aircraft_point = Point(self.longitude, self.latitude)
-            if beam.get_footprint_eclipse().contains(aircraft_point):
+            if beam.get_footprint_eclipse().covers(aircraft_point):
                  #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
                  if snr > best_snr:
                     best_snr = snr

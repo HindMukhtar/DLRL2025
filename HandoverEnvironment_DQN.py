@@ -98,6 +98,23 @@ class LEOEnv(gym.Env):
         print(f"Action received: {action}")
         print(len(self.all_beam_ids))
         reward_penalty = 0
+
+        # Handle penalty action
+        if action == -1:
+            print("No valid actions available! Returning penalty and skipping step.")
+            obs = self._get_obs()
+            base_reward = self._get_reward()
+            final_reward = base_reward - 1.0  # Penalty
+            terminated = False
+            truncated = False
+            if self.current_step >= len(self.route) - 1:
+                terminated = True
+            info = {
+                "available_beams": self.available_beams,
+                "action_mask": self.action_mask
+            }
+            self.current_step += 1
+            return obs, final_reward, terminated, truncated, info
         
         if 0 <= action < len(self.all_beam_ids):
             beam_id = self.all_beam_ids[action]
@@ -199,6 +216,9 @@ def predict_valid_action(model, obs, mask):
     """
     Select the valid action with the highest Q-value for DQN.
     """
+    if not np.any(mask):
+        print("No valid actions available! Returning penalty action.")
+        return -1  # Use -1 to indicate no valid action
     obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1).to(model.device)
     q_values = model.q_net(obs_tensor).detach().cpu().numpy().flatten()
     q_values[~mask] = -1e10  # Mask invalid actions

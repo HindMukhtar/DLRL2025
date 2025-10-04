@@ -97,6 +97,23 @@ class LEOEnv(gym.Env):
         print(f"Action received: {action}")
         print(len(self.all_beam_ids))
         reward_penalty = 0
+
+        # Handle penalty action
+        if action == -1:
+            print("No valid actions available! Returning penalty and skipping step.")
+            obs = self._get_obs()
+            base_reward = self._get_reward()
+            final_reward = base_reward - 1.0  # Penalty
+            terminated = False
+            truncated = False
+            if self.current_step >= len(self.route) - 1:
+                terminated = True
+            info = {
+                "available_beams": self.available_beams,
+                "action_mask": self.action_mask
+            }
+            self.current_step += 1
+            return obs, final_reward, terminated, truncated, info
         
         if 0 <= action < len(self.all_beam_ids):
             beam_id = self.all_beam_ids[action]
@@ -119,10 +136,13 @@ class LEOEnv(gym.Env):
                 print(f"Invalid action: beam {beam_id} not available")
                 self.aircraft.connected_beam = None 
                 self.aircraft.connected_satellite = None 
-                self.aircraft.current_snr = float('-inf')
+                self.aircraft.current_snr = -100
                 reward_penalty = -1.0
         else:
             print(f"Action {action} out of bounds")
+            self.aircraft.connected_beam = None 
+            self.aircraft.connected_satellite = None 
+            self.aircraft.current_snr = -100 
             reward_penalty = -1.0
 
         # Advance simulation
@@ -197,6 +217,9 @@ def mask_fn(env):
 
 def predict_valid_action(model, obs, mask):
     """Manually ensure only valid actions are predicted"""
+    if not np.any(mask):
+        print("No valid actions available! Returning penalty action.")
+        return -1  # Use -1 to indicate no valid action
     # Convert numpy array to torch tensor
     obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1)
     
@@ -226,7 +249,7 @@ def main():
     # Create the DQN agent
     model = MaskablePPO("MlpPolicy", env, verbose=1)
     # Train the agent
-    model.learn(total_timesteps=10000)
+    model.learn(total_timesteps=100000)
 
     # Save the trained model
     model.save("handover_ppo_agent")
