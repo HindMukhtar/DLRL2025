@@ -576,7 +576,7 @@ class Aircraft:
         SNR_dB = Pr_dBW - N_dBW
         return SNR_dB
 
-    def scan_nearby_fast(self, constellation, threshold_km=1500):
+    def scan_nearby_fast(self, constellation, threshold_km=10000):
         """
         Returns a list of all beams where the aircraft is inside the footprint.
         Each entry is a dict with beam, satellite, SNR, load, capacity, etc.
@@ -615,7 +615,7 @@ class Aircraft:
             
             # Check if aircraft is within the beam's elliptical footprint
             aircraft_point = Point(self.longitude, self.latitude)
-            if beam.get_footprint_eclipse().covers(aircraft_point):
+            if beam.get_footprint().intersects(aircraft_point) or beam.get_footprint().contains(aircraft_point):
                  #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
                  if snr > best_snr:
                     best_snr = snr
@@ -704,7 +704,10 @@ class Aircraft:
         # Shannon capacity based on current SNR
         
         # Allocated bandwidth is bounded by shannon's capacity and beam capacity
-        allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
+        if self.connected_beam: 
+            allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
+        else: 
+            allocated = 0 
 
         # Avoid division by zero
         if demand > 0:
@@ -780,10 +783,10 @@ class Aircraft:
         elif not best_candidate_beam and self.connected_beam:
             # Lost connection
             print(f"Time {self.env.now:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
-            #self.connected_beam.load -= 1
+            self.connected_beam.load -= 0
             self.connected_beam = None
             self.connected_satellite = None
-            self.current_snr = float('-inf')
+            self.current_snr = -100
             self.current_latency = 0
 
         elif best_candidate_beam and best_candidate_beam == self.connected_beam:

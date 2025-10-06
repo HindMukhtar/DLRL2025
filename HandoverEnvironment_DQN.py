@@ -137,10 +137,13 @@ class LEOEnv(gym.Env):
                 print(f"Invalid action: beam {beam_id} not available")
                 self.aircraft.connected_beam = None 
                 self.aircraft.connected_satellite = None 
-                self.aircraft.current_snr = float('-inf')
+                self.aircraft.current_snr = -100
                 reward_penalty = -1.0
         else:
             print(f"Action {action} out of bounds")
+            self.aircraft.connected_beam = None 
+            self.aircraft.connected_satellite = None 
+            self.aircraft.current_snr = -100
             reward_penalty = -1.0
 
         # Advance simulation
@@ -241,7 +244,7 @@ def main():
     # Train the agent
     #model.learn(total_timesteps=10000)
     # Custom training using action masking 
-    total_timesteps=10000
+    total_timesteps=100000
     obs, info = env.reset()
     for step in range(total_timesteps):
         # Get current mask

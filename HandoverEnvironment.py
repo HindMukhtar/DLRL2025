@@ -181,7 +181,7 @@ class LEOEnv(gym.Env):
         lat = ac.latitude
         lon = ac.longitude
         alt = ac.height
-        snr = ac.current_snr if ac.current_snr is not None else 0
+        snr = ac.current_snr if ac.current_snr is not None else -100
         load = ac.connected_beam.load if ac.connected_beam else 0
         cap = ac.connected_beam.capacity if ac.connected_beam else 0
         handovers = ac.handover_count

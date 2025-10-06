@@ -575,7 +575,7 @@ class Aircraft:
         SNR_dB = Pr_dBW - N_dBW
         return SNR_dB
 
-    def scan_nearby_fast(self, constellation, threshold_km=1500):
+    def scan_nearby_fast(self, constellation, threshold_km=1000):
         """
         Returns a list of all beams where the aircraft is inside the footprint.
         Each entry is a dict with beam, satellite, SNR, load, capacity, etc.
@@ -602,7 +602,7 @@ class Aircraft:
             dist_3d = self._calculate_3d_distance(sat)
             snr = self.calculate_snr(beam, dist_3d / 1000) # distance in km
             aircraft_point = Point(self.longitude, self.latitude)
-            if beam.get_footprint_eclipse().covers(aircraft_point):
+            if beam.get_footprint().intersects(aircraft_point) or beam.get_footprint().contains(aircraft_point):
                 candidates.append({
                     'sat': sat,
                     'beam': beam,
@@ -613,6 +613,7 @@ class Aircraft:
                     'beam_id': beam.id,
                     'sat_id': sat.ID
                 })
+        print(f"candidates found: {len(candidates)}")
         return candidates
 
     def scan_nearby(self, constellation, threshold_km=500):
@@ -673,7 +674,7 @@ class Aircraft:
         demand = self.demand  # in MB (as per your get_demand_at_time)
 
         # Get available capacity from the current beam (in Gbps, convert to MB for deltaT)
-        if self.connected_beam is not None:
+        if self.connected_beam:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
             beam_capacity_MB = self.connected_beam.capacity * 125 * deltaT  # MB for this timestep
@@ -683,7 +684,10 @@ class Aircraft:
             shannon_capacity = 0 
 
         # Allocated bandwidth is bounded by shannon's capacity and beam capacity
-        allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
+        if self.connected_beam: 
+            allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
+        else: 
+            allocated = 0 
 
         # Avoid division by zero
         if demand > 0:
