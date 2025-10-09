@@ -60,7 +60,7 @@ def display_frames_as_animation(image_folder, interval=40):
     display(HTML(ani.to_jshtml()))
 
 if __name__ == "__main__":
-    image_folder = "simulationImages/PPO"
-    output_gif = "satellite_simulation_ppo.gif"
+    image_folder = "simulationImages/baseline"
+    output_gif = "satellite_simulation_baseline.gif"
     create_gif(image_folder, output_gif, duration=500)
-    display_frames_as_animation("simulationImages/PPO", interval=40)
+    display_frames_as_animation(image_folder, interval=40)
