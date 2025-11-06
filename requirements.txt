@@ -6,3 +6,7 @@ numba
 cartopy
 stable-baselines3
 sb3-contrib
+torch 
+cartopy
+stable_baselines3
+sb3_contrib
