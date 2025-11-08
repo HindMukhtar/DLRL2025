@@ -11,6 +11,7 @@ from LEOEnvironmentRL import initialize, load_route_from_csv
 from HandoverEnvironment import mask_fn
 from sb3_contrib.common.wrappers import ActionMasker
 import pandas as pd
+import simpy
 
 class DecisionTransformerBlock(nn.Module):
     """Single transformer block for Decision Transformer"""
@@ -300,15 +301,59 @@ class OnlineDecisionTransformer:
         self.episode_actions = []
         self.episode_rewards = []
         
+        # Performance tracking for adaptive targets
+        self.recent_episode_returns = deque(maxlen=50)  # Track recent episode performance
+        self.recent_step_rewards = deque(maxlen=200)    # Track recent step rewards
+    
+    def _get_adaptive_target(self) -> float:
+        """Get adaptive target return based on recent performance"""
+        if len(self.recent_episode_returns) == 0:
+            return self.target_return  # Use initial target if no history
+        
+        # Use 75th percentile of recent performance as target
+        return np.percentile(list(self.recent_episode_returns), 75)
+    
+    def _estimate_remaining_return(self, recent_rewards: np.ndarray) -> float:
+        """Estimate remaining return for current episode based on recent step performance"""
+        if len(recent_rewards) == 0:
+            return self.target_return * 0.5  # Conservative estimate
+        
+        # Estimate based on recent reward trend
+        avg_recent_reward = np.mean(recent_rewards[-5:])  # Last 5 steps
+        
+        # Simple heuristic: assume similar performance for remaining steps
+        # This could be made more sophisticated with environment knowledge
+        estimated_remaining_steps = max(50 - len(self.episode_states), 0)
+        
+        return avg_recent_reward * estimated_remaining_steps * 0.99  # Discounted
+    
+    def get_performance_stats(self) -> Dict:
+        """Get current performance statistics"""
+        stats = {
+            'recent_episodes': len(self.recent_episode_returns),
+            'current_target': self._get_adaptive_target(),
+            'avg_recent_return': np.mean(list(self.recent_episode_returns)) if self.recent_episode_returns else 0.0,
+            'avg_recent_step_reward': np.mean(list(self.recent_step_rewards)) if self.recent_step_rewards else 0.0,
+        }
+        
+        if len(self.recent_episode_returns) > 1:
+            stats['return_std'] = np.std(list(self.recent_episode_returns))
+            stats['best_recent_return'] = np.max(list(self.recent_episode_returns))
+            stats['worst_recent_return'] = np.min(list(self.recent_episode_returns))
+        
+        return stats
+        
     def predict_action(self, state: np.ndarray, mask: np.ndarray) -> int:
         """Predict action given current state and action mask"""
         self.model.eval()
         
         with torch.no_grad():
             if len(self.episode_states) == 0:
-                # First step - create arrays of max_length
+                # First step - use conservative initial target or recent performance
+                initial_target = self._get_adaptive_target()
+                
                 returns_to_go = np.zeros((self.max_length, 1))
-                returns_to_go[-1] = self.target_return  # Set target return for last position
+                returns_to_go[-1] = initial_target  # Set adaptive target for last position
                 
                 states = np.zeros((self.max_length, state.shape[0]))
                 states[-1] = state  # Put current state at last position
@@ -324,9 +369,14 @@ class OnlineDecisionTransformer:
                 recent_actions = np.array(self.episode_actions[-recent_len:])
                 recent_rewards = np.array(self.episode_rewards[-recent_len:])
                 
+                # Calculate expected return based on current episode performance
+                current_episode_return = sum(self.episode_rewards)
+                estimated_remaining_return = self._estimate_remaining_return(recent_rewards)
+                dynamic_target = current_episode_return + estimated_remaining_return
+                
                 # Calculate returns-to-go for recent history
                 returns = np.zeros(recent_len + 1)
-                returns[-1] = self.target_return  # Target for next step
+                returns[-1] = dynamic_target  # Use dynamic target based on actual performance
                 for i in range(recent_len - 1, -1, -1):
                     returns[i] = recent_rewards[i] + 0.99 * returns[i + 1]
                 
@@ -347,7 +397,7 @@ class OnlineDecisionTransformer:
                 actions[start_idx:start_idx + history_len] = recent_actions
                 
                 # Place current state
-                returns_to_go[-1] = self.target_return
+                returns_to_go[-1] = dynamic_target
                 states[-1] = state
                 actions[-1] = 0  # Dummy action for current step
                 
@@ -401,7 +451,14 @@ class OnlineDecisionTransformer:
         self.episode_actions.append(action)
         self.episode_rewards.append(reward)
         
+        # Track rewards for adaptive target calculation
+        self.recent_step_rewards.append(reward)
+        
         if done:
+            # Calculate and store episode return
+            episode_return = sum(self.episode_rewards)
+            self.recent_episode_returns.append(episode_return)
+            
             # End of episode - add trajectory to buffer
             if len(self.episode_states) > 0:
                 trajectory = {
@@ -478,16 +535,207 @@ class OnlineDecisionTransformer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+
+class LEOEnv(gym.Env):
+    """
+    Gymnasium environment wrapper for the LEO satellite handover simulation.
+    """
+
+    def __init__(self, constellation_name, route):
+        super(LEOEnv, self).__init__()
+
+        # We'll set a placeholder action space, but update it dynamically
+        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
+
+        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 0.48, 1000, 1000, 1], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
+        self.constellation = constellation_name 
+        self.route = route 
+        self.deltaT = 1
+
+        self.env = None
+        self.earth = None
+        self.aircraft = None
+        self.current_step = 0
+
+        self.available_beams = []  # List of available beams for current step
+        self.action_mask = None
+
+        np.random.seed(42)
+        random.seed(42)
+
+        self._setup_simulation()
+
+    def _setup_simulation(self):
+
+        self.env = simpy.Environment()
+        self.earth = initialize(self.env, self.constellation, self.route)
+        self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
+        self.current_step = 0
+
+        # Build global beam id list and mapping
+        self.all_beam_ids = []
+        self.beam_id_to_obj = {}
+        for plane in self.earth.LEO:
+            for sat in plane.sats:
+                for beam in sat.beams:
+                    self.all_beam_ids.append(beam.id)
+                    self.beam_id_to_obj[beam.id] = beam
+
+        self.action_space = spaces.Discrete(len(self.all_beam_ids))
+
+        # Find available beams for the initial state
+        self.available_beams = self._get_available_beams()
+
+    def _get_available_beams(self):
+        # Returns a list of candidate beams (dicts) from scan_nearby_fast
+        return self.aircraft.scan_nearby_fast(self.earth.LEO)
+    
+    def _get_action_mask(self):
+        mask = np.zeros(len(self.all_beam_ids), dtype=bool)
+        available_ids = [b['beam'].id for b in self.available_beams]
+        for i, beam_id in enumerate(self.all_beam_ids):
+            if beam_id in available_ids:
+                mask[i] = True
+        return mask    
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        np.random.seed(42)
+        random.seed(42)
+        self._setup_simulation()
+        self.action_mask = self._get_action_mask()  # Store mask
+        obs = self._get_obs()
+        info = {
+            "available_beams": self.available_beams,
+            "action_mask": self.action_mask  # Return mask in info
+        }
+        return obs, info
+
+    def step(self, action):
+        # Map action index to beam id
+        print(f"Action received: {action}")
+        print(len(self.all_beam_ids))
+        reward_penalty = 0
+
+        # Handle penalty action
+        if action == -1:
+            print("No valid actions available! Returning penalty and skipping step.")
+            obs = self._get_obs()
+            base_reward = self._get_reward()
+            final_reward = base_reward - 1.0  # Penalty
+            terminated = False
+            truncated = False
+            if self.current_step >= len(self.route) - 1:
+                terminated = True
+            info = {
+                "available_beams": self.available_beams,
+                "action_mask": self.action_mask
+            }
+            self.current_step += 1
+            return obs, final_reward, terminated, truncated, info
+        
+        if 0 <= action < len(self.all_beam_ids):
+            beam_id = self.all_beam_ids[action]
+            available_ids = [b['beam'].id for b in self.available_beams]
+            
+            if beam_id in available_ids:
+                chosen = next(b for b in self.available_beams if b['beam'].id == beam_id)
+                
+                if self.aircraft.connected_beam != chosen['beam']:
+                    print(f"Aircraft {self.aircraft.id} HANDOVER from {self.aircraft.connected_beam.id if self.aircraft.connected_beam else 'None'} to beam {chosen['beam'].id}")
+                    self.aircraft.connected_beam = chosen['beam']
+                    self.aircraft.connected_satellite = chosen['sat']
+                    self.aircraft.current_snr = chosen['snr']
+                    self.aircraft.handover_count += 1
+                else:
+                    print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
+                    # Update SNR in case it changed
+                    self.aircraft.current_snr = chosen['snr']
+            else:
+                print(f"Invalid action: beam {beam_id} not available")
+                self.aircraft.connected_beam = None 
+                self.aircraft.connected_satellite = None 
+                self.aircraft.current_snr = -100
+                reward_penalty = -1.0
+        else:
+            print(f"Action {action} out of bounds")
+            self.aircraft.connected_beam = None 
+            self.aircraft.connected_satellite = None 
+            self.aircraft.current_snr = -100
+            reward_penalty = -1.0
+
+        # Advance simulation
+        self.earth.step_aircraft(folder="ODT")
+        self.earth.advance_constellation(self.earth.deltaT, self.env.now)
+        
+        self.env.run(until=self.env.now + self.earth.deltaT)
+        self.current_step += 1
+
+        # Update available beams for next step
+        self.available_beams = self._get_available_beams()
+
+        # Update action mask for next step 
+        self.action_mask = self._get_action_mask()
+
+        obs = self._get_obs()
+        base_reward = self._get_reward()
+        final_reward = base_reward + reward_penalty  # Add penalty
+        print(f"Current simulation step: {self.current_step}")
+        terminated = False 
+        truncated = False 
+        if self.current_step >= len(self.route) - 1:
+            terminated = True
+        
+        info = {
+            "available_beams": self.available_beams,
+            "action_mask": self.action_mask  # Return mask in info
+        }
+
+        print(f"final reward: {final_reward}, base reward: {base_reward}, penalty: {reward_penalty}")
+
+        return obs, final_reward, terminated, truncated, info
+
+    def _get_obs(self):
+        ac = self.aircraft
+        lat = ac.latitude
+        lon = ac.longitude
+        alt = ac.height
+        snr = ac.current_snr if ac.current_snr is not None else 0
+        load = ac.connected_beam.load if ac.connected_beam else 0
+        cap = ac.connected_beam.capacity if ac.connected_beam else 0
+        handovers = ac.handover_count
+        total_allocated_bw = ac.total_allocated_bandwidth 
+        if ac.allocation_ratios: 
+            allocation_to_demand = ac.allocation_ratios[-1]
+        else: 
+            allocation_to_demand = 0 
+        return np.array([lat, lon, alt, snr, load, cap, handovers, total_allocated_bw, allocation_to_demand], dtype=np.float32)
+
+    def _get_reward(self):
+        if self.aircraft.allocation_ratios:
+            return self.aircraft.allocation_ratios[-1]
+        return 0.0
+
+    def render(self):
+        if self.earth:
+            self.earth.plotMap(plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=[self.aircraft])
+
+    def close(self): 
+        pass
+
 class LEOEnvDecisionTransformer(gym.Env):
     """
     Wrapper environment for Decision Transformer agent
     """
     
-    def __init__(self, constellation_name, route):
+    def __init__(self, constellation_name, route, model_path):
         super().__init__()
         
-        # Use your existing environment setup
-        from HandoverEnvironment import LEOEnv
+        # Use your existing environment setups
         self.base_env = LEOEnv(constellation_name, route)
         
         self.action_space = self.base_env.action_space
@@ -502,7 +750,10 @@ class LEOEnvDecisionTransformer(gym.Env):
             num_layers=3,
             target_return=1.0
         )
-        
+        if model_path: 
+            self.dt_agent.load(model_path)
+            self.dt_agent.model.eval()
+
     def reset(self, **kwargs):
         obs, info = self.base_env.reset(**kwargs)
         return obs, info
@@ -539,8 +790,8 @@ def main():
     constellation_name = inputParams['Constellation'][0]
     route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
     
-    # Create the base environment first
-    base_env = LEOEnvDecisionTransformer(constellation_name, route)
+    # Create the base environment first (no model loading for training from scratch)
+    base_env = LEOEnvDecisionTransformer(constellation_name, route, model_path=None)
     
     # Then wrap with ActionMasker
     env = ActionMasker(base_env, mask_fn)
@@ -578,6 +829,12 @@ def main():
                 break
         
         print(f"Episode {episode + 1}: Steps: {step_count}, Reward: {episode_reward:.3f}")
+        
+        # Show adaptive target info every 10 episodes
+        if (episode + 1) % 10 == 0:
+            stats = base_env.dt_agent.get_performance_stats()
+            print(f"  Current adaptive target: {stats['current_target']:.3f}")
+            print(f"  Recent avg return: {stats['avg_recent_return']:.3f}")
         
         # Train periodically
         if (episode + 1) % train_interval == 0:
