@@ -746,8 +746,8 @@ class LEOEnvDecisionTransformer(gym.Env):
             state_dim=self.observation_space.shape[0],
             action_dim=self.action_space.n,
             max_length=20,
-            embed_dim=128,
-            num_layers=3,
+            embed_dim=64,
+            num_layers=2,
             target_return=1.0
         )
         if model_path: 
