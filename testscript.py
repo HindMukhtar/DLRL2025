@@ -20,144 +20,156 @@ from HandoverEnvironment_ODT import predict_valid_action_dt
 from ODT import OnlineDecisionTransformer
 from LEOEnvironment import LEOEnv as LEOEnvBase
 import pickle
+import gc  # Add garbage collection
 
-# Create PPO environment
+# ==============================================
+# MODEL SELECTION - Choose which model to test
+# ==============================================
+# Options: 'ODT', 'DQN', 'PPO', 'BASELINE'
+SELECTED_MODEL = 'BASELINE'  # Default: ODT
+
+def append_observation_to_file(obs, step, model_name, filename):
+    """Append single observation to file"""
+    # Create header if file doesn't exist
+    if not os.path.exists(filename):
+        with open(filename, 'w') as f:
+            f.write("step,snr,handovers,allocation_ratio\n")
+    
+    # Append observation data
+    with open(filename, 'a') as f:
+        f.write(f"{step},{obs[0]},{obs[1]},{obs[2]}\n")
+    
+    # Periodic garbage collection every 100 steps to manage memory
+    if step % 100 == 0:
+        gc.collect()
+
+print(f"Selected Model for Testing: {SELECTED_MODEL}")
+print("=" * 50)
+
+# Initialize common parameters
 inputParams = pd.read_csv("input.csv")
 constellation_name = inputParams['Constellation'][0]
 route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
-ppo_env = LEOEnvPPO(constellation_name, route)
-ppo_env = ActionMasker(ppo_env, mask_fn)
-# Evaluation with debugging
-obs, info = ppo_env.reset()
-print(f"Initial mask sum: {np.sum(ppo_env.action_mask) if hasattr(ppo_env, 'action_mask') else 'No mask attr'}")
 
-# Load PPO Agent 
-ppo_agent = MaskablePPO("MlpPolicy", ppo_env, verbose=1)
-ppo_agent.load("handover_ppo_agent")
-
-# Create DQN Environment
-inputParams = pd.read_csv("input.csv")
-constellation_name = inputParams['Constellation'][0]
-route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
-dqn_env = LEOEnvDQN(constellation_name, route)
-dqn_env = ActionMasker(dqn_env, mask_fn)
-# Evaluation with debugging
-obs, info = dqn_env.reset()
-print(f"Initial mask sum: {np.sum(dqn_env.action_mask) if hasattr(dqn_env, 'action_mask') else 'No mask attr'}")
-
-# Load DQN Agent 
-dqn_agent = DQN("MlpPolicy", dqn_env, verbose=1, buffer_size=100) 
-dqn_agent.load("handover_dqn_agent")
-
-# Create ODT Environment 
-inputParams = pd.read_csv("input.csv")
-constellation_name = inputParams['Constellation'][0]
-route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
-odt_env = LEOEnvODT(constellation_name, route)
-odt_env = ActionMasker(odt_env, mask_fn)
-# Evaluation with debugging
-obs, info = odt_env.reset()
-print(f"Initial mask sum: {np.sum(odt_env.action_mask) if hasattr(odt_env, 'action_mask') else 'No mask attr'}")
-
-# Load ODT Agent 
-odt_agent = OnlineDecisionTransformer(
-        state_dim=odt_env.observation_space.shape[0],
-        action_dim=odt_env.action_space.n,
+# Initialize only the selected model and environment
+if SELECTED_MODEL == 'PPO':
+    print("Loading PPO Agent...")
+    env = LEOEnvPPO(constellation_name, route)
+    env = ActionMasker(env, mask_fn)
+    agent = MaskablePPO("MlpPolicy", env, verbose=0)
+    agent.load("handover_ppo_agent")
+    env.env.earth.Training = False
+    predict_fn = predict_valid_action
+    
+elif SELECTED_MODEL == 'DQN':
+    print("Loading DQN Agent...")
+    env = LEOEnvDQN(constellation_name, route)
+    env = ActionMasker(env, mask_fn)
+    agent = DQN("MlpPolicy", env, verbose=0, buffer_size=100)
+    agent.load("handover_dqn_agent")
+    env.env.earth.Training = False
+    predict_fn = predict_valid_action_dqn
+    
+elif SELECTED_MODEL == 'ODT':
+    print("Loading ODT Agent...")
+    env = LEOEnvODT(constellation_name, route)
+    env = ActionMasker(env, mask_fn)
+    agent = OnlineDecisionTransformer(
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.n,
         max_length=20,
-        embed_dim=64,
+        embed_dim=64,  
         num_layers=2,
         target_return=1.0
     )
-
-model_path = 'decision_transformer_final.pth'
-odt_agent.load(model_path)
-
-# Initalize baseline environment
-inputParams = pd.read_csv("input.csv")
-constellation_name = inputParams['Constellation'][0]
-route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
-base_env = LEOEnvBase(constellation_name, route)
-
-# Evaluation with debugging
-obs, info = base_env.reset()
-
-# set training to false to enable saving plots 
-base_env.earth.Training = False
-dqn_env.env.earth.Training = False
-ppo_env.env.earth.Training = False
-odt_env.env.earth.Training = False
-
-done_ppo = False
-done_dqn = False
-done_base = False
-done_odt = False
-step_count = 0
-
-obs_ppo, info_ppo = ppo_env.reset()
-obs_dqn, info_dqn = dqn_env.reset()
-obs_base, info_base = base_env.reset()
-obs_odt, info_odt = odt_env.reset()
-
-obs_ppo_list = []
-obs_dqn_list = []
-obs_base_list = []
-obs_odt_list = []
-
-while not (done_ppo or done_dqn or done_base or done_odt):
-    print(f"\n--- Step {step_count} ---")
+    model_path = 'decision_transformer_final.pth'
+    agent.load(model_path)
+    env.env.earth.Training = False
+    predict_fn = predict_valid_action_dt
     
-    # PPO Agent Step
-    mask_ppo = ppo_env.env._get_action_mask()
-    print(f"PPO Valid actions: {np.sum(mask_ppo)}")
-    action_ppo = predict_valid_action(ppo_agent, obs_ppo, mask_ppo)
-    print(f"PPO Action: {action_ppo}, Valid: {mask_ppo[action_ppo]}")
-    obs_ppo, reward_ppo, done_ppo, truncated_ppo, info_ppo = ppo_env.env.step(action_ppo)
-    obs_ppo_list.append(obs_ppo)
+elif SELECTED_MODEL == 'BASELINE':
+    print("Loading Baseline Environment...")
+    env = LEOEnvBase(constellation_name, route)
+    env.earth.Training = False
+    agent = None  # Baseline doesn't use an agent
+    predict_fn = None
+    
+else:
+    raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'DQN', 'PPO', 'BASELINE'")
 
-    # DQN Agent Step
-    mask_dqn = dqn_env.env._get_action_mask()
-    print(f"DQN Valid actions: {np.sum(mask_dqn)}")
-    action_dqn = predict_valid_action_dqn(dqn_agent, obs_dqn, mask_dqn)
-    print(f"DQN Action: {action_dqn}, Valid: {mask_dqn[action_dqn]}")
-    obs_dqn, reward_dqn, done_dqn, truncated_dqn, info_dqn = dqn_env.step(action_dqn)
-    obs_dqn_list.append(obs_dqn)
+print(f"Model {SELECTED_MODEL} loaded successfully!")
+print(f"Route duration: {route_duration}")
+print("=" * 50)
 
+# Initialize environment and tracking variables
+done = False
+step_count = 0
+results_filename = f'{SELECTED_MODEL}_observations.csv'
 
-    # ODT Agent Step
-    mask_odt = odt_env.env._get_action_mask()
-    print(f"ODT Valid actions: {np.sum(mask_odt)}")
-    action_odt = predict_valid_action_dt(odt_agent, obs_odt, mask_odt)
-    print(f"ODT Action: {action_odt}, Valid: {mask_odt[action_odt]}")
-    obs_odt, reward_odt, done_odt, truncated_odt, info_odt = odt_env.step(action_odt)
-    odt_agent.step(obs_odt, action_odt, reward_odt, obs_odt, done_odt or truncated_odt)
-    obs_odt_list.append(obs_odt)
+# Reset environment
+if SELECTED_MODEL == 'BASELINE':
+    obs, info = env.reset()
+else:
+    obs, info = env.reset()
 
-    # Baseline Environment Step
-    obs_base, reward_base, done_base, truncated_base, info_base = base_env.step()
-    obs_base_list.append(obs_base)
+print(f"Starting evaluation for {SELECTED_MODEL} model...")
+print(f"Full route duration: {route_duration} steps")
+print(f"Results will be saved to: {results_filename}")
+
+while not done:
+    # Reduce print frequency to save memory
+    if step_count % 25 == 0:
+        print(f"Step {step_count} - Model: {SELECTED_MODEL}")
+    
+    # Take action based on selected model
+    if SELECTED_MODEL == 'BASELINE':
+        obs, reward, done, truncated, info = env.step()
+        observation_data = [obs[3], obs[6], obs[8]]  # SNR, handovers, allocation
+    elif SELECTED_MODEL == 'ODT':
+        mask = env.env._get_action_mask()
+        action = predict_fn(agent, obs, mask)
+        obs, reward, done, truncated, info = env.step(action)
+        agent.step(obs, action, reward, obs, done or truncated)
+        observation_data = [obs[3], obs[6], obs[8]]
+    else:  # PPO or DQN
+        mask = env.env._get_action_mask()
+        action = predict_fn(agent, obs, mask)
+        if SELECTED_MODEL == 'DQN':
+            obs, reward, done, truncated, info = env.step(action)
+        else:  # PPO
+            obs, reward, done, truncated, info = env.env.step(action)
+        observation_data = [obs[3], obs[6], obs[8]]
+    
+    # Append observation to file immediately
+    append_observation_to_file(observation_data, step_count, SELECTED_MODEL, results_filename)
     
     step_count += 1
 
-# Save results 
+print(f"\nCompleted {step_count} steps for {SELECTED_MODEL}")
 
-# Save observation lists to files for later extraction
+# Save final results summary
+print("Saving final summary...")
 
-# Save as pickle files (recommended for preserving exact numpy arrays)
-with open('obs_base_list.pkl', 'wb') as f:
-    pickle.dump(obs_base_list, f)
+final_results = {
+    'model_tested': SELECTED_MODEL,
+    'steps_completed': step_count,
+    'route_duration': route_duration,
+    'completion_status': done,
+    'observations_file': results_filename
+}
 
-with open('obs_ppo_list.pkl', 'wb') as f:
-    pickle.dump(obs_ppo_list, f)
+with open(f'{SELECTED_MODEL}_summary.pkl', 'wb') as f:
+    pickle.dump(final_results, f)
 
-with open('obs_dqn_list.pkl', 'wb') as f:
-    pickle.dump(obs_dqn_list, f)
-
-with open('obs_odt_list.pkl', 'wb') as f:
-    pickle.dump(obs_odt_list, f)
-
-# Alternative: Save as numpy arrays
-np.save('obs_base_list.npy', np.array(obs_base_list))
-np.save('obs_ppo_list.npy', np.array(obs_ppo_list))
-np.save('obs_dqn_list.npy', np.array(obs_dqn_list))
-np.save('obs_odt_list.npy', np.array(obs_odt_list))
+print("All results saved successfully!")
+print(f"Model tested: {SELECTED_MODEL}")
+print(f"Final step count: {step_count}")
+print(f"Route duration: {route_duration}")
+print(f"Completion status: {done}")
+print(f"Observations saved to: {results_filename}")
+print("Memory optimizations applied:")
+print("- Single model execution")
+print("- Real-time file appending (no memory accumulation)")
+print("- Periodic garbage collection")
+print("- No step limit - full route completed")
 

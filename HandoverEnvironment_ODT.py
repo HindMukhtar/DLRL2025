@@ -24,8 +24,8 @@ def main():
             state_dim=env.observation_space.shape[0],
             action_dim=env.action_space.n,
             max_length=20,
-            embed_dim=128,
-            num_layers=3,
+            embed_dim=64,
+            num_layers=2,
             target_return=1.0
         )
     

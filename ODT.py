@@ -160,7 +160,7 @@ class DecisionTransformerModel(nn.Module):
 class ExperienceBuffer:
     """Buffer to store trajectory data for online learning"""
     
-    def __init__(self, max_size: int = 10000):
+    def __init__(self, max_size: int = 1000):
         self.max_size = max_size
         self.trajectories = deque(maxlen=max_size)
         
