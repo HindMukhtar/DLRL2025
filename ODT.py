@@ -16,7 +16,7 @@ import simpy
 class DecisionTransformerBlock(nn.Module):
     """Single transformer block for Decision Transformer"""
     
-    def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.embed_dim = embed_dim
         self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
@@ -54,7 +54,7 @@ class DecisionTransformerModel(nn.Module):
         max_length: int = 20,
         embed_dim: int = 128,
         num_layers: int = 3,
-        num_heads: int = 8,
+        num_heads: int = 4,
         dropout: float = 0.1
     ):
         super().__init__()
@@ -264,14 +264,19 @@ class OnlineDecisionTransformer:
         max_length: int = 20,
         embed_dim: int = 128,
         num_layers: int = 3,
-        num_heads: int = 8,
+        num_heads: int = 4,
         learning_rate: float = 1e-4,
         target_return: float = 1.0,
+        buffer_size: int = 50,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     ):
         self.device = device
         self.max_length = max_length
         self.target_return = target_return
+        self.eval_mode = False  # Add evaluation mode flag
+        
+        # Sliding window for memory efficiency
+        self.episode_window_size = max_length * 2  # Keep 2x max_length for context
         
         # Initialize model
         self.model = DecisionTransformerModel(
@@ -287,7 +292,7 @@ class OnlineDecisionTransformer:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         
         # Experience buffer
-        self.buffer = ExperienceBuffer()
+        self.buffer = ExperienceBuffer(max_size=buffer_size)
         
         # Current trajectory data
         self.current_trajectory = {
@@ -296,10 +301,10 @@ class OnlineDecisionTransformer:
             'rewards': [],
         }
         
-        # Episode tracking
-        self.episode_states = []
-        self.episode_actions = []
-        self.episode_rewards = []
+        # Episode tracking with sliding window (fixed memory)
+        self.episode_states = deque(maxlen=self.episode_window_size)
+        self.episode_actions = deque(maxlen=self.episode_window_size) 
+        self.episode_rewards = deque(maxlen=self.episode_window_size)
         
         # Performance tracking for adaptive targets
         self.recent_episode_returns = deque(maxlen=50)  # Track recent episode performance
@@ -321,9 +326,11 @@ class OnlineDecisionTransformer:
         # Estimate based on recent reward trend
         avg_recent_reward = np.mean(recent_rewards[-5:])  # Last 5 steps
         
-        # Simple heuristic: assume similar performance for remaining steps
-        # This could be made more sophisticated with environment knowledge
-        estimated_remaining_steps = max(50 - len(self.episode_states), 0)
+        # Estimate remaining steps (conservative since we use sliding window)
+        # We don't know exact episode length, so use a reasonable estimate
+        current_episode_length = len(self.episode_states)
+        estimated_total_length = max(current_episode_length * 1.5, 100)  # Estimate
+        estimated_remaining_steps = max(estimated_total_length - current_episode_length, 0)
         
         return avg_recent_reward * estimated_remaining_steps * 0.99  # Discounted
     
@@ -342,6 +349,14 @@ class OnlineDecisionTransformer:
             stats['worst_recent_return'] = np.min(list(self.recent_episode_returns))
         
         return stats
+    
+    def set_eval_mode(self, eval_mode: bool = True):
+        """Set evaluation mode to prevent memory accumulation"""
+        self.eval_mode = eval_mode
+        if eval_mode:
+            self.model.eval()
+        else:
+            self.model.train()
         
     def predict_action(self, state: np.ndarray, mask: np.ndarray) -> int:
         """Predict action given current state and action mask"""
@@ -361,16 +376,16 @@ class OnlineDecisionTransformer:
                 actions = np.zeros(self.max_length, dtype=int)  # All zeros (dummy actions)
                 timesteps = np.arange(self.max_length)
             else:
-                # Use recent history
+                # Use recent history from sliding window
                 recent_len = min(len(self.episode_states), self.max_length - 1)
                 
-                # Get recent trajectory
-                recent_states = np.array(self.episode_states[-recent_len:])
-                recent_actions = np.array(self.episode_actions[-recent_len:])
-                recent_rewards = np.array(self.episode_rewards[-recent_len:])
+                # Get recent trajectory from deques
+                recent_states = np.array(list(self.episode_states)[-recent_len:] if recent_len > 0 else [])
+                recent_actions = np.array(list(self.episode_actions)[-recent_len:] if recent_len > 0 else [])
+                recent_rewards = np.array(list(self.episode_rewards)[-recent_len:] if recent_len > 0 else [])
                 
                 # Calculate expected return based on current episode performance
-                current_episode_return = sum(self.episode_rewards)
+                current_episode_return = sum(self.episode_rewards)  # Sum from sliding window
                 estimated_remaining_return = self._estimate_remaining_return(recent_rewards)
                 dynamic_target = current_episode_return + estimated_remaining_return
                 
@@ -446,7 +461,7 @@ class OnlineDecisionTransformer:
     
     def step(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
         """Process step and add to current trajectory"""
-        # Add to episode tracking
+        # Always track episode data with sliding window
         self.episode_states.append(state.copy())
         self.episode_actions.append(action)
         self.episode_rewards.append(reward)
@@ -455,26 +470,31 @@ class OnlineDecisionTransformer:
         self.recent_step_rewards.append(reward)
         
         if done:
-            # Calculate and store episode return
-            episode_return = sum(self.episode_rewards)
+            # Calculate episode return from sliding window
+            episode_return = sum(self.episode_rewards)  # Sum of window
             self.recent_episode_returns.append(episode_return)
             
-            # End of episode - add trajectory to buffer
-            if len(self.episode_states) > 0:
+            # Only add to buffer if not in evaluation mode
+            if not self.eval_mode and len(self.episode_states) > 0:
+                # Convert deques to arrays for buffer storage
                 trajectory = {
-                    'states': np.array(self.episode_states),
-                    'actions': np.array(self.episode_actions),
-                    'rewards': np.array(self.episode_rewards)
+                    'states': np.array(list(self.episode_states)),
+                    'actions': np.array(list(self.episode_actions)),
+                    'rewards': np.array(list(self.episode_rewards))
                 }
                 self.buffer.add_trajectory(trajectory)
             
-            # Reset episode tracking
-            self.episode_states = []
-            self.episode_actions = []
-            self.episode_rewards = []
+            # Clear episode tracking for next episode
+            self.episode_states.clear()
+            self.episode_actions.clear()
+            self.episode_rewards.clear()
     
     def train_step(self, batch_size: int = 32):
         """Perform one training step"""
+        # Skip training in evaluation mode
+        if self.eval_mode:
+            return {'loss': 0.0, 'skipped': 'eval_mode'}
+            
         if len(self.buffer.trajectories) < batch_size:
             return {}  # Not enough data
             

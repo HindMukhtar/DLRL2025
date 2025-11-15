@@ -65,7 +65,7 @@ elif SELECTED_MODEL == 'DQN':
     print("Loading DQN Agent...")
     env = LEOEnvDQN(constellation_name, route)
     env = ActionMasker(env, mask_fn)
-    agent = DQN("MlpPolicy", env, verbose=0, buffer_size=100)
+    agent = DQN("MlpPolicy", env, verbose=0, buffer_size=50)
     agent.load("handover_dqn_agent")
     env.env.earth.Training = False
     predict_fn = predict_valid_action_dqn
