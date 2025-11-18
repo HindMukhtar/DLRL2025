@@ -33,11 +33,11 @@ def append_observation_to_file(obs, step, model_name, filename):
     # Create header if file doesn't exist
     if not os.path.exists(filename):
         with open(filename, 'w') as f:
-            f.write("step,snr,handovers,allocation_ratio\n")
+            f.write("step, snr, load, capacity, handovers, total_allocated_bw, allocation\n")
     
     # Append observation data
     with open(filename, 'a') as f:
-        f.write(f"{step},{obs[0]},{obs[1]},{obs[2]}\n")
+        f.write(f"{step},{obs[0]},{obs[1]},{obs[2]},{obs[3]},{obs[4]},{obs[5]}\n")
     
     # Periodic garbage collection every 100 steps to manage memory
     if step % 100 == 0:
@@ -49,7 +49,7 @@ print("=" * 50)
 # Initialize common parameters
 inputParams = pd.read_csv("input.csv")
 constellation_name = inputParams['Constellation'][0]
-route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
+route, route_duration = load_route_from_csv('route_10s_interpolated.csv', skip_rows=3)
 
 # Initialize only the selected model and environment
 if SELECTED_MODEL == 'PPO':
@@ -124,13 +124,13 @@ while not done:
     # Take action based on selected model
     if SELECTED_MODEL == 'BASELINE':
         obs, reward, done, truncated, info = env.step()
-        observation_data = [obs[3], obs[6], obs[8]]  # SNR, handovers, allocation
+        observation_data = [obs[3], obs[4], obs[5], obs[6], obs[7], obs[8]]  # SNR, load, capacity, handovers, total allocated bw,  allocation
     elif SELECTED_MODEL == 'ODT':
         mask = env.env._get_action_mask()
         action = predict_fn(agent, obs, mask)
         obs, reward, done, truncated, info = env.step(action)
         agent.step(obs, action, reward, obs, done or truncated)
-        observation_data = [obs[3], obs[6], obs[8]]
+        observation_data = [obs[3], obs[4], obs[5], obs[6], obs[7], obs[8]]
     else:  # PPO or DQN
         mask = env.env._get_action_mask()
         action = predict_fn(agent, obs, mask)
@@ -138,7 +138,7 @@ while not done:
             obs, reward, done, truncated, info = env.step(action)
         else:  # PPO
             obs, reward, done, truncated, info = env.env.step(action)
-        observation_data = [obs[3], obs[6], obs[8]]
+        observation_data = [obs[3], obs[4], obs[5], obs[6], obs[7], obs[8]]
     
     # Append observation to file immediately
     append_observation_to_file(observation_data, step_count, SELECTED_MODEL, results_filename)

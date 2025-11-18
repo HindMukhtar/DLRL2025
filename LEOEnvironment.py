@@ -155,7 +155,7 @@ class Beam:
         self.snr = snr # Base SNR, will be adjusted for user position
         self.id = id  # Optional: unique identifier for the beam
         self.load_amplitude = 0.5 
-        self.load_frequency = 2 * math.pi / 900 
+        self.load_frequency = 2 * math.pi / 100 
         self.load_phase = random.uniform(0, 2 * math.pi)
         self.base_load = 0.5
         
@@ -240,7 +240,7 @@ class Beam:
             time_seconds: Current simulation time in seconds
         """
         self.load = self.get_load_at_time(time_seconds)
-        self.capacity = self.max_capacity*self.load
+        self.capacity = self.max_capacity*(1 - self.load) 
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -508,15 +508,18 @@ def load_route_from_csv(filename, skip_rows=10):
     return route, route_duration 
 
 class Aircraft: 
-    def __init__(self, env, aircraft_id, route=None, height=10000):
+    def __init__(self, env, aircraft_id, route=None, height=10000, passengers = None):
         self.deltaT = 0 
+        self.time = 0  # in seconds
         self.env = env
         self.id = aircraft_id
+        self.passengers = passengers
         #self.update_interval = update_interval
-        self.Gr = 5 #dBi
+        self.Gr = 25 #dBi
 
         self.route = route or []
         self.route_index = 0
+        self.demand = 0 
 
         # Initialize position from route if available
         if self.route:
@@ -681,7 +684,50 @@ class Aircraft:
         Args:
             time_seconds: Current simulation time in seconds
         """
-        self.demand = self.get_demand_at_time(deltaT)   
+        self.demand = self.get_demand_at_time(deltaT)    
+    
+    def step_passengers(self, deltaT):
+        if self.passengers:
+            total_throughput = 0
+            min_latency = float('inf')
+            self.demand = 0 
+            for passenger in self.passengers:
+                demand, throughput, latency = passenger.step_application(deltaT) # Convert Mbps to MB for deltaT
+                self.demand += demand*deltaT/8 
+                total_throughput += throughput
+                min_latency = min(min_latency, latency)
+
+        return self.demand, total_throughput, min_latency
+
+    def queing_delay(self, deltaT):
+        """
+        Calculate queuing delay based on current load and data size.
+        
+        Args:
+            data_size_mb: Size of the data to be transmitted in megabytes  """ 
+        
+        if self.connected_beam is None: 
+            return 1000, 0   # No connection means infinite delay
+        
+        if self.connected_beam.load >= 1.0:
+            return 1000, 0   # Infinite delay if load is at or above capacity
+        
+        shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
+        transmission_rate_mbps = min(shannon_capacity, self.connected_beam.capacity*1000) # Convert Gbps to Mbps
+        
+        if transmission_rate_mbps <= 0.0:
+            return 1000, 0.0
+    
+        service_Mb = transmission_rate_mbps * deltaT  # Mb that can be served this step
+        demand_Mb = self.demand * 8  # Convert MB to Mb for calculation
+        
+        if demand_Mb <= service_Mb:
+            return 0, transmission_rate_mbps  # No delay if demand can be served immediately
+        else: 
+            backlog_Mb    = demand_Mb - service_Mb
+            delay_seconds = backlog_Mb / (transmission_rate_mbps)   # Convert MB to Mb for calculation
+
+        return delay_seconds, transmission_rate_mbps
 
     def allocation_ratio(self, deltaT):
         """
@@ -689,29 +735,28 @@ class Aircraft:
         Throughput is limited by the available beam capacity.
         """
         # Update demand for this timestep
-        self.update_demand(deltaT)
-        demand = self.demand  # in MB (as per your get_demand_at_time)
+        #self.update_demand(deltaT)
+        #demand = self.demand  # in MB (as per your get_demand_at_time)
 
         # Get available capacity from the current beam (in Gbps, convert to MB for deltaT)
-        if self.connected_beam is not None:
+        if self.connected_beam:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
             beam_capacity_MB = self.connected_beam.capacity * 125 * deltaT  # MB for this timestep
-            shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Gbps
+            shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
         else:
             beam_capacity_MB = 0
-            shannon_capacity = 0
-        # Shannon capacity based on current SNR
-        
+            shannon_capacity = 0 
+
         # Allocated bandwidth is bounded by shannon's capacity and beam capacity
         if self.connected_beam: 
-            allocated = min(demand, shannon_capacity * 125 * deltaT, beam_capacity_MB)
+            allocated = min(self.demand, (shannon_capacity * deltaT)/8, beam_capacity_MB)
         else: 
             allocated = 0 
 
         # Avoid division by zero
-        if demand > 0:
-            ratio = allocated / demand
+        if self.demand > 0:
+            ratio = allocated / self.demand
         else:
             ratio = 0
 
@@ -719,7 +764,28 @@ class Aircraft:
         self.total_allocated_bandwidth += allocated
         self.allocation_ratios.append(ratio)            
 
-        return ratio, allocated, demand, beam_capacity_MB   
+        return ratio, allocated, self.demand, beam_capacity_MB   
+    
+    def get_qoe_metrics(self, deltaT):
+        """
+        Returns qoe metrics based on passenger usage
+        """
+        demand, total_throughput_required, max_latency_allowed = self.step_passengers(deltaT)
+        ratio, allocated, demand, beam_capacity_MB = self.allocation_ratio(deltaT) 
+        queing_delay, transmission_rate_mbps = self.queing_delay(deltaT)
+        propagation_latency = self._calculate_latency()*2 # Round trip latency
+        return {
+            'allocation_ratio': ratio,
+            'allocated_bandwidth_MB': allocated,
+            'demand_MB': demand,
+            'beam_capacity_MB': beam_capacity_MB,
+            'queuing_delay_s': queing_delay,
+            'transmission_rate_mbps': transmission_rate_mbps,
+            'propagation_latency_s': propagation_latency, 
+            'throughput_req_mbps': total_throughput_required, 
+            'latency_req_s': max_latency_allowed/1000, # convert ms to s 
+            'SNR_dB': self.current_snr
+        }
 
     def time_between_points(self, lat1, lon1, lat2, lon2, speed_kmph):
         # Calculate distance in kilometers
@@ -748,6 +814,7 @@ class Aircraft:
             print(f"route index {self.route_index} of {len(self.route)}")
             deltaT = self.time_between_points(prevpoint['lat'], prevpoint['lon'], point['lat'], point['lon'], self.speed_kmph)
             deltaT_seconds = deltaT * 3600 if deltaT and deltaT > 0 else 1  # At least 1 second
+            self.time += deltaT_seconds
             print(f"new posotion {self.longitude} {self.latitude} speed {self.speed_kmph} deltaT {deltaT_seconds}")
             return deltaT_seconds
         # If not using a route, you could implement the old logic here (with direction), but skip for real route.
@@ -765,8 +832,6 @@ class Aircraft:
         if best_candidate_beam and best_candidate_beam != self.connected_beam:
             # Handover or initial connection
             if self.connected_beam:
-                # Disconnect from old beam
-                #self.connected_beam.load -= 1
                 self.handover_count += 1
                 print(f"Time {self.env.now:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
             else:
@@ -775,7 +840,6 @@ class Aircraft:
             # Connect to new beam
             self.connected_beam = best_candidate_beam
             self.connected_satellite = best_candidate_sat
-            #self.connected_beam.load += 1
             self.current_snr = best_snr
             self.current_latency = self._calculate_latency() # Update latency
             print(f"  >> New Status: SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms, Beam Load: {self.connected_beam.load}, Beam Capacity:{self.connected_beam.capacity}")
@@ -783,7 +847,6 @@ class Aircraft:
         elif not best_candidate_beam and self.connected_beam:
             # Lost connection
             print(f"Time {self.env.now:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
-            self.connected_beam.load -= 0
             self.connected_beam = None
             self.connected_satellite = None
             self.current_snr = -100
@@ -821,7 +884,178 @@ class Aircraft:
             propagation_delay = total_distance_m / Vc # Vc is speed of light in m/s
             return propagation_delay
         return 0           
-            
+
+class Passenger: 
+    def __init__(self, ID, application = None):
+        self.ID = ID
+        self.application = application 
+        self.APP_PROBS = {
+                        "streaming":      0.25,
+                        "voip":           0.10,
+                        "email":          0.10,
+                        "web":            0.30,
+                        "file_transfer":  0.10,
+                        "video_conference": 0.15,
+                    }
+        
+        self.APP_CLASSES = {
+                            "streaming":        lambda: StreamingApp(),
+                            "voip":             lambda: VoIPApp(),
+                            "email":            lambda: EmailApp(),
+                            "web":              lambda: WebBrowsingApp(),
+                            "file_transfer":    lambda: FileTransferApp(),
+                            "video_conference": lambda: VideoConferenceApp(),  
+                        }
+
+    def step_application(self, dt_seconds=10):
+        # 1) If active, advance session time
+        if self.application is not None:
+            self.application.step_session_time(dt_seconds)
+            if not self.application.session_active():
+                self.application = None
+        
+        # 2) If idle, maybe start a new app
+        if self.application is None:
+            start_prob = 0.05  # 5% chance per 10 seconds
+            if random.random() < start_prob:
+                apps  = list(self.APP_PROBS.keys())
+                probs = list(self.APP_PROBS.values())
+                app_name = random.choices(apps, weights=probs, k=1)[0]
+                self.application = self.APP_CLASSES[app_name]()  # Each app now uses seconds
+
+        # 3) Demand
+        if self.application is None: 
+            print("No application active")
+        return (0.0, 0.0, 0.0) if self.application is None else (self.application.get_demand(dt_seconds), self.application.base_demand_mbps, self.application.latency_ms)
+
+        
+class StreamingApp:
+    def __init__(self, app_type='video', base_demand_mbps=5, latency_ms=300, duration=40*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self):
+        return self.session_time < self.duration
+
+    def get_demand(self, time):
+        # Simple model: demand is constant over duration
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
+class VoIPApp:
+    def __init__(self, app_type='voip', base_demand_mbps=0.1, latency_ms=100, duration=5*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self):
+        return self.session_time < self.duration
+    
+    def get_demand(self, time):
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
+class EmailApp:
+    def __init__(self, app_type='email', base_demand_mbps=0.5, latency_ms=200, duration=3*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self):
+        return self.session_time < self.duration
+
+    def get_demand(self, time):
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
+class WebBrowsingApp:
+    def __init__(self, app_type='web', base_demand_mbps=1, latency_ms=500, duration=10*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps    
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self):
+        return self.session_time < self.duration
+
+    def get_demand(self, time):
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
+class FileTransferApp:
+    def __init__(self, app_type='file_transfer', base_demand_mbps=10, latency_ms=1000, duration=10*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self): 
+        return self.session_time < self.duration
+
+    def get_demand(self, time):
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
+class VideoConferenceApp:
+    def __init__(self, app_type='video_conference', base_demand_mbps=2, latency_ms=150, duration=45*60, sessionid = None):
+        self.sessionid = sessionid
+        self.app_type = app_type
+        self.base_demand_mbps = base_demand_mbps
+        self.latency_ms = latency_ms
+        self.duration = duration
+        self.session_time = 0 
+
+    def step_session_time(self, time_increment): 
+        self.session_time += time_increment
+
+    def session_active(self): 
+        return self.session_time < self.duration
+
+    def get_demand(self, time):
+        if self.session_active():
+            return self.base_demand_mbps
+        else:
+            return 0
+
 # Earth consisting of cells
 class Earth:
     def __init__(self, env,  constellation, aircraft, window=None):
@@ -886,14 +1120,20 @@ class Earth:
             #scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
             deltaT = ac.move_and_connect_aircraft(self)  # Move aircraft and manage connections
             self.deltaT = deltaT
-            ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
+            #ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
+            qoe_metrics = ac.get_qoe_metrics(deltaT)
+            ratio = qoe_metrics['allocation_ratio']
+            allocated = qoe_metrics['allocated_bandwidth_MB']
+            demand = qoe_metrics['demand_MB']
+            beam_capacity_MB = qoe_metrics['beam_capacity_MB']
             print(f"\n[SimTime {env.now}] Aircraft {ac.id} scan:")
             # for result in scan_results:
             #     if result['type'] == 'beam':
             #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
             print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
-        self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
-            #yield env.timeout(deltaT)             
+        #self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
+            #yield env.timeout(deltaT)  
+            return qoe_metrics            
 
     def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
@@ -1082,9 +1322,14 @@ def initialize(env, constellationType, route):
         - Buffers and processes are created on all GTs and satellites used for sending the blocks throughout the network
     """
 
-    # Load earth and gateways
-    aircraft1 = Aircraft(env, "A-380", route=route, height=10000)
-    #aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=80000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
+    # Load earth, aircraft, passengers and consellations 
+    passenger1 = Passenger("P-001")
+    passenger2 = Passenger("P-002")
+    passenger3 = Passenger("P-003")
+    passenger4 = Passenger("P-004")
+    passenger5 = Passenger("P-005")
+
+    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, passengers=[passenger1, passenger2, passenger3, passenger4, passenger5])  # Example aircraft with route and passenger 
     earth = Earth(env, constellationType, [aircraft1])
 
     print("Initialized Earth")
@@ -1261,7 +1506,7 @@ class LEOEnv(gym.Env):
     def step(self):
 
         # Advance simulation
-        self.earth.step_aircraft(self.env)
+        qoe_metrics = self.earth.step_aircraft(self.env)
         self.earth.advance_constellation(self.earth.deltaT, self.env.now)
         
         self.env.run(until=self.env.now + self.earth.deltaT)
