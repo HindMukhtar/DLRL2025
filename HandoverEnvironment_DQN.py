@@ -25,9 +25,10 @@ class LEOEnv(gym.Env):
         # We'll set a placeholder action space, but update it dynamically
         self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
 
-        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 60000, 100, 1, 0.48, 1000, 1000, 1], dtype=np.float32)
+        #[lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity]
+        # Observation space: 
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.constellation = constellation_name 
@@ -178,25 +179,73 @@ class LEOEnv(gym.Env):
         return obs, final_reward, terminated, truncated, info
 
     def _get_obs(self):
+        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
         ac = self.aircraft
         lat = ac.latitude
         lon = ac.longitude
         alt = ac.height
-        snr = ac.current_snr if ac.current_snr is not None else 0
-        load = ac.connected_beam.load if ac.connected_beam else 0
-        cap = ac.connected_beam.capacity if ac.connected_beam else 0
         handovers = ac.handover_count
-        total_allocated_bw = ac.total_allocated_bandwidth 
-        if ac.allocation_ratios: 
-            allocation_to_demand = ac.allocation_ratios[-1]
-        else: 
-            allocation_to_demand = 0 
-        return np.array([lat, lon, alt, snr, load, cap, handovers, total_allocated_bw, allocation_to_demand], dtype=np.float32)
+        load = ac.connected_beam.load if ac.connected_beam else 0
+        snr = qoe['SNR_dB'] if qoe and 'SNR_dB' in qoe else -100
+        allocated_bw = qoe['allocated_bandwidth_MB'] if qoe and 'allocated_bandwidth_MB' in qoe else 0
+        allocation_ratio = qoe['allocation_ratio'] if qoe and 'allocation_ratio' in qoe else 0
+        demand_MB = qoe['demand_MB'] if qoe and 'demand_MB' in qoe else 0
+        throughput_req = qoe['throughput_req_mbps'] if qoe and 'throughput_req_mbps' in qoe else 0
+        queing_delay_s = qoe['queuing_delay_s'] if qoe and 'queuing_delay_s' in qoe else 0
+        propagation_latency_s = qoe['propagation_latency_s'] if qoe and 'propagation_latency_s' in qoe else 0
+        transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
+        latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
+        beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
+        
+        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
 
     def _get_reward(self):
-        if self.aircraft.allocation_ratios:
-            return self.aircraft.allocation_ratios[-1]
-        return 0.0
+        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        if not qoe or "throughput_req_mbps" not in qoe or "latency_req_s" not in qoe:
+            return 0.0
+
+        print(f"QoE metrics: {qoe}")
+
+        deltaT = self.aircraft.deltaT
+
+        # --- Throughput satisfaction ---
+        throughput_req = qoe["throughput_req_mbps"]          # sum of min app throughputs (Mbps)
+        allocated_MB   = qoe["allocated_bandwidth_MB"]       # MB over this timestep
+        allocated_mbps = (allocated_MB * 8.0) / deltaT       # Mb / s
+
+        if throughput_req > 0:
+            throughput_satisfaction = min(allocated_mbps / throughput_req, 1.0)
+        else:
+            throughput_satisfaction = 1.0
+
+        # --- Latency satisfaction ---
+        total_latency_s = qoe["queuing_delay_s"] + qoe["propagation_latency_s"]
+        latency_req_s   = qoe["latency_req_s"]
+
+        if latency_req_s > 0:
+            if total_latency_s <= latency_req_s:
+                latency_satisfaction = 1.0
+            else:
+                # degrade linearly from 1 at threshold to 0 at 2×threshold
+                ratio = total_latency_s / latency_req_s
+                latency_satisfaction = max(0.0, 1.0 - (ratio - 1.0))
+        else:
+            latency_satisfaction = 1.0
+
+        # --- Combine throughput + latency ---
+        w_thr = 0.7   # throughput weight
+        w_lat = 0.3   # latency weight
+
+        reward = (
+            w_thr * throughput_satisfaction +
+            w_lat * latency_satisfaction
+        )
+
+        # Optional: handover penalty if you track it
+        # if self.handover_happened:
+        #     reward -= 0.05
+
+        return float(reward)
 
     def render(self):
         if self.earth:

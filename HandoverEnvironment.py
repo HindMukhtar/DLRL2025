@@ -25,9 +25,10 @@ class LEOEnv(gym.Env):
         self.max_beams_per_step = max_beams_per_step
         self.action_space = spaces.Discrete(self.max_beams_per_step)
 
-        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 60000, 100, 1, 0.48, 1000, 1000, 1], dtype=np.float32)
+        #[lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity]
+        # Observation space: 
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.constellation = constellation_name 
