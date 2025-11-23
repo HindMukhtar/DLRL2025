@@ -916,7 +916,7 @@ class Passenger:
         
         # 2) If idle, maybe start a new app
         if self.application is None:
-            start_prob = 0.05  # 5% chance per 10 seconds
+            start_prob = 0.5  # 5% chance per 10 seconds
             if random.random() < start_prob:
                 apps  = list(self.APP_PROBS.keys())
                 probs = list(self.APP_PROBS.values())
