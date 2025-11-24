@@ -294,7 +294,7 @@ def main():
     # Create the DQN agent
     model = MaskablePPO("MlpPolicy", env, verbose=1)
     # Train the agent
-    model.learn(total_timesteps=100000)
+    model.learn(total_timesteps=10000)
 
     # Save the trained model
     model.save("handover_ppo_agent")
