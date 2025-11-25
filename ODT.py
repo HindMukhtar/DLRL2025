@@ -568,8 +568,8 @@ class LEOEnv(gym.Env):
         self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
 
         # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 60000, 100, 1, 0.48, 1000, 1000, 1], dtype=np.float32)
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.constellation = constellation_name 
