@@ -856,7 +856,7 @@ def main():
     # Setup environment
     inputParams = pd.read_csv("input.csv")
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
+    route, route_duration = load_route_from_csv('route_10s_interpolated.csv', skip_rows=0)
     
     # Create the base environment first (no model loading for training from scratch)
     base_env = LEOEnvDecisionTransformer(constellation_name, route, model_path=None)
