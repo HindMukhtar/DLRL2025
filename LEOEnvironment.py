@@ -1533,20 +1533,25 @@ class LEOEnv(gym.Env):
         return obs, final_reward, terminated, truncated, info
 
     def _get_obs(self):
+        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
         ac = self.aircraft
         lat = ac.latitude
         lon = ac.longitude
         alt = ac.height
-        snr = ac.current_snr if ac.current_snr is not None else 0
-        load = ac.connected_beam.load if ac.connected_beam else 0
-        cap = ac.connected_beam.capacity if ac.connected_beam else 0
         handovers = ac.handover_count
-        total_allocated_bw = ac.total_allocated_bandwidth 
-        if ac.allocation_ratios: 
-            allocation_to_demand = ac.allocation_ratios[-1]
-        else: 
-            allocation_to_demand = 0 
-        return np.array([lat, lon, alt, snr, load, cap, handovers, total_allocated_bw, allocation_to_demand], dtype=np.float32)
+        load = ac.connected_beam.load if ac.connected_beam else 0
+        snr = qoe['SNR_dB'] if qoe and 'SNR_dB' in qoe else -100
+        allocated_bw = qoe['allocated_bandwidth_MB'] if qoe and 'allocated_bandwidth_MB' in qoe else 0
+        allocation_ratio = qoe['allocation_ratio'] if qoe and 'allocation_ratio' in qoe else 0
+        demand_MB = qoe['demand_MB'] if qoe and 'demand_MB' in qoe else 0
+        throughput_req = qoe['throughput_req_mbps'] if qoe and 'throughput_req_mbps' in qoe else 0
+        queing_delay_s = qoe['queuing_delay_s'] if qoe and 'queuing_delay_s' in qoe else 0
+        propagation_latency_s = qoe['propagation_latency_s'] if qoe and 'propagation_latency_s' in qoe else 0
+        transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
+        latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
+        beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
+        
+        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
 
     def _get_reward(self):
         if self.aircraft.allocation_ratios:

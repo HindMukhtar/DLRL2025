@@ -39,6 +39,7 @@ class LEOEnv(gym.Env):
         self.earth = None
         self.aircraft = None
         self.current_step = 0
+        self.handover_occurred = False
 
         self.available_beams = []  # List of available beams for current step (limited)
         self.action_mask = None
@@ -105,6 +106,7 @@ class LEOEnv(gym.Env):
         print(f"Action received: {action}")
         print(f"Available beam candidates: {len([c for c in self.current_beam_candidates if c is not None])}")
         reward_penalty = 0
+        self.handover_occurred = False
 
         # Handle penalty action
         if action == -1:
@@ -133,6 +135,7 @@ class LEOEnv(gym.Env):
                 self.aircraft.connected_satellite = chosen['sat']
                 self.aircraft.current_snr = chosen['snr']
                 self.aircraft.handover_count += 1
+                self.handover_occurred = True
             else:
                 print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
                 # Update SNR in case it changed
@@ -240,8 +243,8 @@ class LEOEnv(gym.Env):
         )
 
         # Optional: handover penalty if you track it
-        # if self.handover_happened:
-        #     reward -= 0.05
+        if self.handover_occurred:
+            reward -= 0.1
 
         return float(reward)
 
@@ -287,14 +290,14 @@ def main():
     # Create the environment
     inputParams = pd.read_csv("input.csv")
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_10s_interpolated.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv('route_1s_interpolated_short.csv', skip_rows=0)
     env = LEOEnv(constellation_name, route)
     env = ActionMasker(env, mask_fn)
 
     # Create the DQN agent
     model = MaskablePPO("MlpPolicy", env, verbose=1)
     # Train the agent
-    model.learn(total_timesteps=10000)
+    model.learn(total_timesteps=100000)
 
     # Save the trained model
     model.save("handover_ppo_agent")

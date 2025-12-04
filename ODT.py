@@ -580,6 +580,7 @@ class LEOEnv(gym.Env):
         self.earth = None
         self.aircraft = None
         self.current_step = 0
+        self.handover_occurred = False
 
         self.available_beams = []  # List of available beams for current step
         self.action_mask = None
@@ -640,6 +641,7 @@ class LEOEnv(gym.Env):
         print(f"Action received: {action}")
         print(len(self.all_beam_ids))
         reward_penalty = 0
+        self.handover_occurred = False
 
         # Handle penalty action
         if action == -1:
@@ -671,6 +673,7 @@ class LEOEnv(gym.Env):
                     self.aircraft.connected_satellite = chosen['sat']
                     self.aircraft.current_snr = chosen['snr']
                     self.aircraft.handover_count += 1
+                    self.handover_occurred = True
                 else:
                     print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
                     # Update SNR in case it changed
@@ -712,7 +715,8 @@ class LEOEnv(gym.Env):
         
         info = {
             "available_beams": self.available_beams,
-            "action_mask": self.action_mask  # Return mask in info
+            "action_mask": self.action_mask,  # Return mask in info
+            "handover_occurred": self.handover_occurred
         }
 
         print(f"final reward: {final_reward}, base reward: {base_reward}, penalty: {reward_penalty}")
@@ -783,8 +787,8 @@ class LEOEnv(gym.Env):
         )
 
         # Optional: handover penalty if you track it
-        # if self.handover_happened:
-        #     reward -= 0.05
+        if self.handover_occurred == True:
+            reward -= 0.1
 
         return float(reward)
 
@@ -813,7 +817,7 @@ class LEOEnvDecisionTransformer(gym.Env):
         self.dt_agent = OnlineDecisionTransformer(
             state_dim=self.observation_space.shape[0],
             action_dim=self.action_space.n,
-            max_length=20,
+            max_length=120,
             embed_dim=64,
             num_layers=2,
             target_return=1.0
@@ -856,7 +860,7 @@ def main():
     # Setup environment
     inputParams = pd.read_csv("input.csv")
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_10s_interpolated.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv('route_1s_interpolated_short.csv', skip_rows=0)
     
     # Create the base environment first (no model loading for training from scratch)
     base_env = LEOEnvDecisionTransformer(constellation_name, route, model_path=None)
