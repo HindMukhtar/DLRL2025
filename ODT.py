@@ -869,7 +869,7 @@ def main():
     env = ActionMasker(base_env, mask_fn)
     
     # Training parameters
-    num_episodes = 100
+    num_episodes = 100000
     train_interval = 5  # Train every 5 episodes
     
     print("Starting Online Decision Transformer training...")
