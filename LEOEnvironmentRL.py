@@ -62,6 +62,24 @@ Vc  = 299792458         # Speed of light [m/s]
 k   = 1.38e-23          # Boltzmann's constant
 eff = 0.55              # Efficiency of the parabolic antenna
 
+# Frequency band configurations for different constellations
+FREQUENCY_BANDS = {
+    'OneWeb': {
+        'fc': 12.5e9,  # Hz - Ku-band center frequency
+        'bw': 250e6,   # Hz - Bandwidth
+        'Pt': 40,      # dBm - Transmit power
+        'Gt': 30,      # dBi - Antenna gain
+        'name': 'Ku-band',
+    },
+    'Starlink': {
+        'fc': 12.0e9,  # Hz - Ku-band center frequency
+        'bw': 240e6,   # Hz - Bandwidth
+        'Pt': 35,      # dBm - Transmit power
+        'Gt': 28,      # dBi - Antenna gain
+        'name': 'Ku-band',
+    }
+}
+
 ###############################################################################
 ###############################     Classes    ################################
 ###############################################################################
