@@ -66,6 +66,26 @@ Vc  = 299792458         # Speed of light [m/s]
 k   = 1.38e-23          # Boltzmann's constant
 eff = 0.55              # Efficiency of the parabolic antenna
 
+
+
+# Frequency band configurations for different constellations
+FREQUENCY_BANDS = {
+    'OneWeb': {
+        'fc': 12.5e9,  # Hz - Ku-band center frequency
+        'bw': 250e6,   # Hz - Bandwidth
+        'Pt': 40,      # dBm - Transmit power
+        'Gt': 30,      # dBi - Antenna gain
+        'name': 'Ku-band',
+    },
+    'Starlink': {
+        'fc': 12.0e9,  # Hz - Ku-band center frequency
+        'bw': 240e6,   # Hz - Bandwidth
+        'Pt': 35,      # dBm - Transmit power
+        'Gt': 28,      # dBi - Antenna gain
+        'name': 'Ku-band',
+    }
+}
+
 ###############################################################################
 ###############################     Classes    ################################
 ###############################################################################
@@ -144,34 +164,55 @@ class OrbitalPlane:
             sat.rotate(delta_t, self.longitude, self.period)
             sat.update_beam_loads(env_time)  # Update beam loads based on time
 
+
 class Beam:
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
-                 load=1, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
+                 load=1, capacity=10, snr=0, id=None, constellation='OneWeb'):
         self.center_lat = center_lat
         self.center_lon = center_lon
         self.width_deg = width_deg
         self.height_deg = height_deg
-        self.load = load # Current number of users connected
-        self.snr = snr # Base SNR, will be adjusted for user position
-        self.id = id  # Optional: unique identifier for the beam
+        self.load = load
+        self.snr = snr
+        self.id = id
         self.load_amplitude = 0.5 
         self.load_frequency = 2 * math.pi / 100 
         self.load_phase = random.uniform(0, 2 * math.pi)
         self.base_load = 0.5
         
-        # Calculate ellipse parameters based on width_deg and height_deg
+        # Calculate ellipse parameters
         self._calculate_ellipse_parameters()
 
+        # Get frequency configuration for this constellation
+        if constellation in FREQUENCY_BANDS:
+            config = FREQUENCY_BANDS[constellation]
+            self.frequency = config['fc'] / 1e9  # Convert to GHz for display
+            self.frequency_hz = config['fc']  # Store in Hz for calculations
+            self.bw = config['bw']
+            self.Pt = config['Pt']
+            self.Gt = config['Gt']
+            self.band_type = config['name']
+        else:
+            # Default values if constellation not found
+            self.frequency = 12.5  # GHz
+            self.frequency_hz = 12.5e9  # Hz
+            self.bw = 250e6
+            self.Pt = 40
+            self.Gt = 30
+            self.band_type = 'Ku-band'
+
         if constellation == 'OneWeb': 
-            self.max_capacity = 0.48 # Max beam capacity is 480 Mbps 
-            self.capacity = self.max_capacity*self.load
-            self.max_ds_speed = 150 #Mbps 
-            self.max_us_speed = 30 #Mbps 
-            self.max_latency = 70 #ms 
-            self.bw = 250e6 #Hz 
-            self.frequency = 15 #GHz 
-            self.Pt = 40 #dBm - transmit power 
-            self.Gt = 30 #dBi - antenna gain 
+            self.max_capacity = 0.48  # Gbps
+            self.capacity = self.max_capacity * self.load
+            self.max_ds_speed = 150  # Mbps 
+            self.max_us_speed = 30   # Mbps 
+            self.max_latency = 70    # ms 
+        elif constellation == 'Starlink':
+            self.max_capacity = 0.50  # Gbps
+            self.capacity = self.max_capacity * self.load
+            self.max_ds_speed = 200  # Mbps
+            self.max_us_speed = 40   # Mbps
+            self.max_latency = 50    # ms
         
     def _calculate_ellipse_parameters(self):
         """Calculates semi_major_axis, semi_minor_axis, and orientation_angle."""
@@ -243,7 +284,8 @@ class Beam:
         self.capacity = self.max_capacity*(1 - self.load) 
 
 class Satellite:
-    def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
+    def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, 
+                 quota=500, power=10, constellation_type='OneWeb'):
         self.ID = ID                    # A unique ID given to every satellite
         self.in_plane = in_plane        # Orbital plane where the satellite is deployed
         self.i_in_plane = i_in_plane    # Index in orbital plane
@@ -304,65 +346,74 @@ class Satellite:
         self.env = env
 
         # Satellite beams - assuming OneWeb beams right now 
-        self.beams = []
+        self.beams_band1 = []  # Band 1 beams
+        self.beams_band2 = []  # Band 2 beams
+        self.beams = []  # Combined list for backward compatibility
+        
         self.init_beams()
 
     def init_beams(self):
-        # OneWeb: coverage area is a square, divided into 16 horizontal strips (vertically stacked)
+        """Initialize beams with single frequency band"""
+        # OneWeb: 16 beams
         total_area_km2 = 1_718_000
-        side_km = total_area_km2 ** 0.5  # ≈ 1310 km
+        side_km = total_area_km2 ** 0.5
         n_beams = 16
         beam_width_km = side_km
-        beam_height_km = side_km / n_beams  # ≈ 81.9 km
+        beam_height_km = side_km / n_beams
 
-        deg_per_km = 1 / 111  # Approximate conversion
-        # add some tolerance to beam height and width 
+        deg_per_km = 1 / 111
         beam_width_deg = (beam_width_km + 100) * deg_per_km
         beam_height_deg = (beam_height_km + 50) * deg_per_km
 
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
 
-        if self.constellationType =="OneWeb":  
-
-            # The top edge of the coverage square
+        if self.constellationType == "OneWeb":
             top_lat = sat_lat + (side_km / 2) * deg_per_km
 
+            # Create beams for single frequency
             for i in range(n_beams):
-                # Each beam's center is halfway between its top and bottom edge
                 beam_top = top_lat - i * beam_height_deg
                 beam_bottom = beam_top - beam_height_deg
                 center_lat = (beam_top + beam_bottom) / 2
                 center_lon = sat_lon
-                beam_id = f"{self.ID}_beam_{i+1}"  # Number beams 1 to 16
-                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg, id=beam_id))
-        else:
+                beam_id = f"{self.ID}_beam_{i+1}"
+                beam = Beam(center_lat, center_lon, beam_width_deg, beam_height_deg, 
+                           id=beam_id, constellation=self.constellationType)
+                self.beams.append(beam)
+
+        elif self.constellationType == "Starlink":
             # Center beam
-            self.beams.append(Beam(sat_lat, sat_lon, beam_width_deg, beam_height_deg))
+            beam_id = f"{self.ID}_beam_0"
+            beam = Beam(sat_lat, sat_lon, beam_width_deg, beam_height_deg,
+                       id=beam_id, constellation=self.constellationType)
+            self.beams.append(beam)
 
-            # Beams on circle
+            # 15 beams around center
             n_circle_beams = n_beams - 1
-            radius_deg = beam_height_deg * 4 # Circle radius in degrees
-
+            radius_deg = beam_height_deg * 4
             for i in range(n_circle_beams):
                 angle = 2 * math.pi * i / n_circle_beams
                 dlat = radius_deg * math.cos(angle)
-                dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))  # adjust for latitude distortion
+                dlon = radius_deg * math.sin(angle) / math.cos(math.radians(sat_lat))
                 center_lat = sat_lat + dlat
                 center_lon = sat_lon + dlon
-                self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
+                beam_id = f"{self.ID}_beam_{i+1}"
+                beam = Beam(center_lat, center_lon, beam_width_deg, beam_height_deg,
+                           id=beam_id, constellation=self.constellationType)
+                self.beams.append(beam)
 
-    def maxSlantRange(self):
-        """
-        Maximum distance from satellite to edge of coverage area is calculated using the following formula:
-        D_max(minElevationAngle, h) = sqrt(Re**2*sin**2(minElevationAngle) + 2*Re*h + h**2) - Re*sin(minElevationAngle)
-        This formula is based on the NGSO constellation design chapter page 16.
-        """
-        eps = math.radians(self.minElevationAngle)
+        def maxSlantRange(self):
+            """
+            Maximum distance from satellite to edge of coverage area is calculated using the following formula:
+            D_max(minElevationAngle, h) = sqrt(Re**2*sin**2(minElevationAngle) + 2*Re*h + h**2) - Re*sin(minElevationAngle)
+            This formula is based on the NGSO constellation design chapter page 16.
+            """
+            eps = math.radians(self.minElevationAngle)
 
-        distance = math.sqrt((Re+self.h)**2-(Re*math.cos(eps))**2) - Re*math.sin(eps)
+            distance = math.sqrt((Re+self.h)**2-(Re*math.cos(eps))**2) - Re*math.sin(eps)
 
-        return distance
+            return distance
 
     def __repr__(self):
         return '\nID = {}\n orbital plane= {}, index in plane= {}, h={}\n pos r = {}, pos theta = {},' \
@@ -550,29 +601,27 @@ class Aircraft:
             self.id, self.latitude, self.longitude, self.height)
 
     def calculate_snr(self, beam, distance_km):
-        # Supervisor's SNR Calculation Method
-        # Constants
+        """Calculate SNR using the beam's frequency band"""
         T = 290  # Noise temperature (K)
         
-        # Beam parameters (assumed to be in dBm, dBi, Hz, etc.)
-        Pt_dBm = beam.Pt  # Transmit power in dBm
-        Gt_dBi = beam.Gt  # Transmit antenna gain in dBi
-        Gr_dBi = self.Gr  # Aircraft receive antenna gain in dBi
-        f_Hz = beam.frequency * 1e9  # Frequency in Hz (beam.frequency in GHz)
-        B_Hz = beam.bw  # Bandwidth in Hz
+        Pt_dBm = beam.Pt
+        Gt_dBi = beam.Gt
+        Gr_dBi = self.Gr
+        f_Hz = beam.frequency_hz  # Use frequency in Hz
+        B_Hz = beam.bw
 
-        # Convert dBm to dBW
         Pt_dBW = Pt_dBm - 30
 
-        # Free-space path loss (FSPL) in dB
+        # Free-space path loss
         d_m = distance_km * 1000
-        if d_m == 0: return float('inf') # Avoid log(0)
+        if d_m == 0: 
+            return float('inf')
         FSPL_dB = 20 * math.log10(d_m) + 20 * math.log10(f_Hz) - 147.55
 
-        # Received power in dBW
+        # Received power
         Pr_dBW = Pt_dBW + Gt_dBi + Gr_dBi - FSPL_dB
 
-        # Noise power in dBW
+        # Noise power
         N_dBW = 10 * math.log10(k * T * B_Hz)
 
         # SNR in dB
@@ -1435,14 +1484,32 @@ class LEOEnv(gym.Env):
     def __init__(self, constellation_name, route):
         super(LEOEnv, self).__init__()
 
-        # We'll set a placeholder action space, but update it dynamically
-        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
+        self.action_space = spaces.Discrete(1)
 
-        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, -100, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 100, 100, 1000], dtype=np.float32)
+        # Observation space: 15 dimensions (no multiband)
+        # [lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio,
+        #  demand_MB, throughput_req, queuing_delay, propagation_latency,
+        #  transmission_rate, latency_req, beam_capacity]
+        
+        low = np.array([
+            -90, -180, 0,      # lat, lon, alt
+            -100, 0, 0,        # snr, load, handovers
+            0, 0, 0,           # allocated_bw, allocation_ratio, demand_MB
+            0, 0, 0,           # throughput_req, queuing_delay, propagation_latency
+            0, 0, 0            # transmission_rate, latency_req, beam_capacity
+        ], dtype=np.float32)
+        
+        high = np.array([
+            90, 180, 15000,    # lat, lon, alt
+            100, 100, 1000,    # snr, load, handovers
+            1000, 1.0, 1000,   # allocated_bw, allocation_ratio, demand_MB
+            200, 10, 1,        # throughput_req, queuing_delay, propagation_latency
+            200, 1, 1000       # transmission_rate, latency_req, beam_capacity
+        ], dtype=np.float32)
+        
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
+        # Rest of __init__ remains the same...
         self.constellation = constellation_name 
         self.route = route 
         self.deltaT = 1
@@ -1452,8 +1519,7 @@ class LEOEnv(gym.Env):
         self.aircraft = None
         self.current_step = 0
 
-        self.available_beams = []  # List of available beams for current step
-
+        self.available_beams = []
         np.random.seed(42)
         random.seed(42)
 
@@ -1533,8 +1599,10 @@ class LEOEnv(gym.Env):
         return obs, final_reward, terminated, truncated, info
 
     def _get_obs(self):
+        """Get observation (15 dimensions, single frequency)"""
         qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
         ac = self.aircraft
+        
         lat = ac.latitude
         lon = ac.longitude
         alt = ac.height
@@ -1545,14 +1613,20 @@ class LEOEnv(gym.Env):
         allocation_ratio = qoe['allocation_ratio'] if qoe and 'allocation_ratio' in qoe else 0
         demand_MB = qoe['demand_MB'] if qoe and 'demand_MB' in qoe else 0
         throughput_req = qoe['throughput_req_mbps'] if qoe and 'throughput_req_mbps' in qoe else 0
-        queing_delay_s = qoe['queuing_delay_s'] if qoe and 'queuing_delay_s' in qoe else 0
+        queuing_delay_s = qoe['queuing_delay_s'] if qoe and 'queuing_delay_s' in qoe else 0
         propagation_latency_s = qoe['propagation_latency_s'] if qoe and 'propagation_latency_s' in qoe else 0
         transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
         latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
         beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
         
-        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
-
+        return np.array([
+            lat, lon, alt,
+            snr, load, handovers,
+            allocated_bw, allocation_ratio, demand_MB,
+            throughput_req, queuing_delay_s, propagation_latency_s,
+            transmission_rate_mbps, latency_req_s, beam_capacity
+        ], dtype=np.float32)
+    
     def _get_reward(self):
         if self.aircraft.allocation_ratios:
             return self.aircraft.allocation_ratios[-1]
