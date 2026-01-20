@@ -285,9 +285,10 @@ def predict_valid_action(model, obs, mask):
 
 def main(): 
     # Create the environment
-    inputParams = pd.read_csv("input.csv")
+    base_dir = os.path.dirname(__file__)
+    inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_5s_interpolated.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
     env = LEOEnv(constellation_name, route)
     env = ActionMasker(env, mask_fn)
 
@@ -299,7 +300,7 @@ def main():
     # Train the agent
     #model.learn(total_timesteps=10000)
     # Custom training using action masking 
-    total_timesteps=100000
+    total_timesteps=10000
     obs, info = env.reset()
     for step in range(total_timesteps):
         # Get current mask
