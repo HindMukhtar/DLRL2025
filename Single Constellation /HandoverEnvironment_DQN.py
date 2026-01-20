@@ -12,23 +12,23 @@ import torch
 import random
 
 import sb3_contrib
+print(dir(sb3_contrib))
 
 class LEOEnv(gym.Env):
     """
     Gymnasium environment wrapper for the LEO satellite handover simulation.
     """
 
-    def __init__(self, constellation_name, route, max_beams_per_step=64):
+    def __init__(self, constellation_name, route):
         super(LEOEnv, self).__init__()
 
-        # Limit action space to reduce numerical instability
-        self.max_beams_per_step = max_beams_per_step
-        self.action_space = spaces.Discrete(self.max_beams_per_step)
+        # We'll set a placeholder action space, but update it dynamically
+        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
 
-        #[lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity]
+        #[lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s]
         # Observation space: 
-        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000], dtype=np.float32)
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000, 10, 120, 60], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.constellation = constellation_name 
@@ -41,9 +41,8 @@ class LEOEnv(gym.Env):
         self.current_step = 0
         self.handover_occurred = False
 
-        self.available_beams = []  # List of available beams for current step (limited)
+        self.available_beams = []  # List of available beams for current step
         self.action_mask = None
-        self.current_beam_candidates = []  # Current step's beam candidates
 
         np.random.seed(42)
         random.seed(42)
@@ -57,34 +56,29 @@ class LEOEnv(gym.Env):
         self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
         self.current_step = 0
 
+        # Build global beam id list and mapping
+        self.all_beam_ids = []
+        self.beam_id_to_obj = {}
+        for plane in self.earth.LEO:
+            for sat in plane.sats:
+                for beam in sat.beams:
+                    self.all_beam_ids.append(beam.id)
+                    self.beam_id_to_obj[beam.id] = beam
+
+        self.action_space = spaces.Discrete(len(self.all_beam_ids))
+
         # Find available beams for the initial state
         self.available_beams = self._get_available_beams()
-        self._update_action_candidates()
 
     def _get_available_beams(self):
         # Returns a list of candidate beams (dicts) from scan_nearby_fast
         return self.aircraft.scan_nearby_fast(self.earth.LEO)
     
-    def _update_action_candidates(self):
-        """Update the current beam candidates (limited to max_beams_per_step)"""
-        all_candidates = self.available_beams
-        
-        # Sort by SNR (descending) and limit to max_beams_per_step
-        if all_candidates:
-            sorted_candidates = sorted(all_candidates, key=lambda x: x['snr'], reverse=True)
-            self.current_beam_candidates = sorted_candidates[:self.max_beams_per_step]
-        else:
-            self.current_beam_candidates = []
-        
-        # Pad with None if we have fewer candidates than max_beams_per_step
-        while len(self.current_beam_candidates) < self.max_beams_per_step:
-            self.current_beam_candidates.append(None)
-    
     def _get_action_mask(self):
-        """Create action mask for current beam candidates"""
-        mask = np.zeros(self.max_beams_per_step, dtype=bool)
-        for i, candidate in enumerate(self.current_beam_candidates):
-            if candidate is not None:
+        mask = np.zeros(len(self.all_beam_ids), dtype=bool)
+        available_ids = [b['beam'].id for b in self.available_beams]
+        for i, beam_id in enumerate(self.all_beam_ids):
+            if beam_id in available_ids:
                 mask[i] = True
         return mask    
 
@@ -96,15 +90,15 @@ class LEOEnv(gym.Env):
         self.action_mask = self._get_action_mask()  # Store mask
         obs = self._get_obs()
         info = {
-            "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
+            "available_beams": self.available_beams,
             "action_mask": self.action_mask  # Return mask in info
         }
         return obs, info
 
     def step(self, action):
-        # Map action index to beam candidate
+        # Map action index to beam id
         print(f"Action received: {action}")
-        print(f"Available beam candidates: {len([c for c in self.current_beam_candidates if c is not None])}")
+        print(len(self.all_beam_ids))
         reward_penalty = 0
         self.handover_occurred = False
 
@@ -119,36 +113,45 @@ class LEOEnv(gym.Env):
             if self.current_step >= len(self.route) - 1:
                 terminated = True
             info = {
-                "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
+                "available_beams": self.available_beams,
                 "action_mask": self.action_mask
             }
             self.current_step += 1
             return obs, final_reward, terminated, truncated, info
         
-        # Check if action is valid and within bounds
-        if 0 <= action < self.max_beams_per_step and self.current_beam_candidates[action] is not None:
-            chosen = self.current_beam_candidates[action]
+        if 0 <= action < len(self.all_beam_ids):
+            beam_id = self.all_beam_ids[action]
+            available_ids = [b['beam'].id for b in self.available_beams]
             
-            if self.aircraft.connected_beam != chosen['beam']:
-                print(f"Aircraft {self.aircraft.id} HANDOVER from {self.aircraft.connected_beam.id if self.aircraft.connected_beam else 'None'} to beam {chosen['beam'].id}")
-                self.aircraft.connected_beam = chosen['beam']
-                self.aircraft.connected_satellite = chosen['sat']
-                self.aircraft.current_snr = chosen['snr']
-                self.aircraft.handover_count += 1
-                self.handover_occurred = True
+            if beam_id in available_ids:
+                chosen = next(b for b in self.available_beams if b['beam'].id == beam_id)
+                
+                if self.aircraft.connected_beam != chosen['beam']:
+                    print(f"Aircraft {self.aircraft.id} HANDOVER from {self.aircraft.connected_beam.id if self.aircraft.connected_beam else 'None'} to beam {chosen['beam'].id}")
+                    self.aircraft.connected_beam = chosen['beam']
+                    self.aircraft.connected_satellite = chosen['sat']
+                    self.aircraft.current_snr = chosen['snr']
+                    self.aircraft.handover_count += 1
+                else:
+                    print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
+                    # Update SNR in case it changed
+                    self.aircraft.current_snr = chosen['snr']
+                    self.handover_occurred = True
             else:
-                print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
-                # Update SNR in case it changed
-                self.aircraft.current_snr = chosen['snr']
+                print(f"Invalid action: beam {beam_id} not available")
+                self.aircraft.connected_beam = None 
+                self.aircraft.connected_satellite = None 
+                self.aircraft.current_snr = -100
+                reward_penalty = -1.0
         else:
-            print(f"Invalid action: {action}")
+            print(f"Action {action} out of bounds")
             self.aircraft.connected_beam = None 
             self.aircraft.connected_satellite = None 
             self.aircraft.current_snr = -100
             reward_penalty = -1.0
 
         # Advance simulation
-        self.earth.step_aircraft()
+        self.earth.step_aircraft(folder="DQN")
         self.earth.advance_constellation(self.earth.deltaT, self.env.now)
         
         self.env.run(until=self.env.now + self.earth.deltaT)
@@ -156,7 +159,6 @@ class LEOEnv(gym.Env):
 
         # Update available beams for next step
         self.available_beams = self._get_available_beams()
-        self._update_action_candidates()
 
         # Update action mask for next step 
         self.action_mask = self._get_action_mask()
@@ -171,7 +173,7 @@ class LEOEnv(gym.Env):
             terminated = True
         
         info = {
-            "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
+            "available_beams": self.available_beams,
             "action_mask": self.action_mask  # Return mask in info
         }
 
@@ -197,8 +199,11 @@ class LEOEnv(gym.Env):
         transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
         latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
         beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
+        service_drop_s = qoe['service_drop_s'] if qoe and 'service_drop_s' in qoe else 0
+        dwell_remaining_s = qoe['dwell_remaining_s'] if qoe and 'dwell_remaining_s' in qoe else 0
+        ttt_remaining_s = qoe['ttt_remaining_s'] if qoe and 'ttt_remaining_s' in qoe else 0
         
-        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
+        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s], dtype=np.float32)
 
     def _get_reward(self):
         qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
@@ -244,7 +249,7 @@ class LEOEnv(gym.Env):
 
         # Optional: handover penalty if you track it
         if self.handover_occurred:
-            reward -= 0.1
+            reward -= 0.05
 
         return float(reward)
 
@@ -265,42 +270,65 @@ def mask_fn(env):
         print("Mask function called: mask is None!")
     return mask
 
-
 def predict_valid_action(model, obs, mask):
-    """Manually ensure only valid actions are predicted"""
+    """
+    Select the valid action with the highest Q-value for DQN.
+    """
     if not np.any(mask):
         print("No valid actions available! Returning penalty action.")
         return -1  # Use -1 to indicate no valid action
-    
-    # Convert numpy array to torch tensor
-    obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1)
-    
-    # Get action using the model's predict method with action mask
-    # This is more stable than manually manipulating logits
-    try:
-        action, _states = model.predict(obs_tensor.numpy(), action_masks=mask.reshape(1, -1), deterministic=True)
-        return int(action[0]) if hasattr(action, '__len__') else int(action)
-    except Exception as e:
-        print(f"Prediction error: {e}. Falling back to random valid action.")
-        # Fallback: select a random valid action
-        valid_actions = np.where(mask)[0]
-        return np.random.choice(valid_actions) if len(valid_actions) > 0 else -1
+    obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1).to(model.device)
+    q_values = model.q_net(obs_tensor).detach().cpu().numpy().flatten()
+    q_values[~mask] = -1e10  # Mask invalid actions
+    action = np.argmax(q_values)
+    return action
 
-def main():
+def main(): 
     # Create the environment
     inputParams = pd.read_csv("input.csv")
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_1s_interpolated_short.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv('route_5s_interpolated.csv', skip_rows=0)
     env = LEOEnv(constellation_name, route)
     env = ActionMasker(env, mask_fn)
 
     # Create the DQN agent
-    model = MaskablePPO("MlpPolicy", env, verbose=1)
+    #model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32)
+    model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32)
+    # Call once just to initialize everything 
+    model.learn(total_timesteps=1)
     # Train the agent
-    model.learn(total_timesteps=100000)
+    #model.learn(total_timesteps=10000)
+    # Custom training using action masking 
+    total_timesteps=100000
+    obs, info = env.reset()
+    for step in range(total_timesteps):
+        # Get current mask
+        mask = env.env._get_action_mask()  # Unwrap if using ActionMasker
+
+        # Get Q-values from the model
+        obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1).to(model.device)
+        q_values = model.q_net(obs_tensor).detach().cpu().numpy().flatten()
+
+        # Mask invalid actions
+        q_values[~mask] = -1e10
+        action = np.argmax(q_values)
+
+        # Step in the environment
+        next_obs, reward, done, truncated, info = env.step(action)
+
+        # Store transition in replay buffer
+        model.replay_buffer.add(obs, next_obs, action, reward, done, [info])
+
+        # Train the model
+        if step > model.learning_starts:
+            model.train(batch_size=model.batch_size, gradient_steps=1)
+
+        obs = next_obs
+        if done or truncated:
+            obs, info = env.reset()
 
     # Save the trained model
-    model.save("handover_ppo_agent")
+    model.save("handover_dqn_agent")
 
 
     # Evaluation with debugging
@@ -312,7 +340,7 @@ def main():
 
     done = False
     step_count = 0
-    while not done:
+    while not done and step_count < route_duration:
         print(f"\n--- Step {step_count} ---")
         
         # Get current mask
@@ -324,7 +352,7 @@ def main():
         print(f"Manually predicted valid action: {action}")
         print(f"Action is valid: {mask[action]}")
         
-        obs, reward, done, truncated, info = env.env.step(action)
+        obs, reward, done, truncated, info = env.step(action)
         step_count += 1
 
     # Print evaluation summary using aircraft object
@@ -349,5 +377,5 @@ def main():
 
     print("="*50)
 
-if __name__ == "__main__":  
+if __name__ == "__main__":
     main()

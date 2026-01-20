@@ -567,9 +567,9 @@ class LEOEnv(gym.Env):
         # We'll set a placeholder action space, but update it dynamically
         self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
 
-        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000], dtype=np.float32)
+        # Observation space:
+        low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        high = np.array([90, 180, 60000, 100, 1, 1000, 1000, 1, 1500, 60, 10, 10, 100, 10, 1000, 10, 120, 60], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.constellation = constellation_name 
@@ -741,8 +741,11 @@ class LEOEnv(gym.Env):
         transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
         latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
         beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
+        service_drop_s = qoe['service_drop_s'] if qoe and 'service_drop_s' in qoe else 0
+        dwell_remaining_s = qoe['dwell_remaining_s'] if qoe and 'dwell_remaining_s' in qoe else 0
+        ttt_remaining_s = qoe['ttt_remaining_s'] if qoe and 'ttt_remaining_s' in qoe else 0
         
-        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
+        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s], dtype=np.float32)
 
     def _get_reward(self):
         qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
@@ -860,7 +863,7 @@ def main():
     # Setup environment
     inputParams = pd.read_csv("input.csv")
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_1s_interpolated_short.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv('route_5s_interpolated.csv', skip_rows=0)
     
     # Create the base environment first (no model loading for training from scratch)
     base_env = LEOEnvDecisionTransformer(constellation_name, route, model_path=None)

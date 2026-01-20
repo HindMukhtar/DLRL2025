@@ -1,4 +1,3 @@
-import csv
 import time
 import pandas as pd
 import math
@@ -18,13 +17,11 @@ from shapely.geometry.polygon import Polygon
 from cartopy.feature import ShapelyFeature
 import matplotlib.patches as mpatches
 from shapely.geometry import box
-from shapely.geometry import Polygon
 from shapely.affinity import scale, rotate, translate
 from scipy.spatial import KDTree
-import numpy as np
 import random
-import gymnasium as gym
-from gymnasium import spaces
+import csv
+
 
 ###############################################################################
 #################################    Simpy    #################################
@@ -32,8 +29,7 @@ from gymnasium import spaces
 
 receivedDataBlocks = []
 createdBlocks = []
-np.random.seed(42)
-random.seed(42)
+seed = np.random.seed(1)
 
 upGSLRates = []
 downGSLRates = []
@@ -145,6 +141,9 @@ class OrbitalPlane:
             sat.update_beam_loads(env_time)  # Update beam loads based on time
 
 class Beam:
+    _pop_density = None
+    _pop_shape = None
+    start_utc_hour = 0.0
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
                  load=1, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
         self.center_lat = center_lat
@@ -158,12 +157,18 @@ class Beam:
         self.load_frequency = 2 * math.pi / 100 
         self.load_phase = random.uniform(0, 2 * math.pi)
         self.base_load = 0.5
+        self._last_load_time = None
+        self.noise_state = 0.0
+        self.noise_tau_s = 900.0
+        self.noise_sigma = 0.08
+        self.peak_local_hour = 18.0
         
         # Calculate ellipse parameters based on width_deg and height_deg
         self._calculate_ellipse_parameters()
 
         if constellation == 'OneWeb': 
-            self.max_capacity = 0.48 # Max beam capacity is 480 Mbps 
+            #self.max_capacity = 7.2 #Gbps 
+            self.max_capacity = 0.48 #Gbps reduce for now as we only have a single agent 
             self.capacity = self.max_capacity*self.load
             self.max_ds_speed = 150 #Mbps 
             self.max_us_speed = 30 #Mbps 
@@ -216,9 +221,70 @@ class Beam:
         final_ellipse = translate(scaled_ellipse, xoff=self.center_lon, yoff=self.center_lat)
         return final_ellipse
 
+    @classmethod
+    def _load_pop_map(cls):
+        if cls._pop_density is not None:
+            return
+        pop_map_path = os.path.join(os.path.dirname(__file__), "PopMap_500.png")
+        try:
+            img = Image.open(pop_map_path).convert("L")
+            arr = np.array(img, dtype=np.float32)
+            max_val = np.max(arr)
+            if max_val > 0:
+                arr = arr / max_val
+            cls._pop_density = arr
+            cls._pop_shape = arr.shape
+        except Exception:
+            cls._pop_density = None
+            cls._pop_shape = None
+
+    def _pop_density_at(self, lat, lon):
+        Beam._load_pop_map()
+        if Beam._pop_density is None:
+            return None
+        height, width = Beam._pop_shape
+        x = (lon + 180.0) / 360.0 * (width - 1)
+        y = (90.0 - lat) / 180.0 * (height - 1)
+        xi = int(min(max(round(x), 0), width - 1))
+        yi = int(min(max(round(y), 0), height - 1))
+        return float(Beam._pop_density[yi, xi])
+    
+    def _update_noise(self, dt_seconds):
+        if dt_seconds <= 0:
+            return
+        decay = math.exp(-dt_seconds / self.noise_tau_s)
+        std = self.noise_sigma * math.sqrt(1 - decay * decay)
+        self.noise_state = self.noise_state * decay + random.gauss(0.0, std)
+
+    def off_axis_gain_db(self, lat, lon, edge_loss_db=12.0):
+        dx = lon - self.center_lon
+        dy = lat - self.center_lat
+        a = max(self.semi_major_axis, 1e-6)
+        b = max(self.semi_minor_axis, 1e-6)
+        u = (dx / a) ** 2 + (dy / b) ** 2  # u=1 at beam edge
+        if u <= 1.0:
+            return -edge_loss_db * u
+        return -edge_loss_db * 1.5  # outside footprint, extra penalty
+    
+    # def get_load_at_time(self, time_seconds):
+    #     """
+    #     Calculate the load at a given time using a sinusoidal function.
+        
+    #     Args:
+    #         time_seconds: Current simulation time in seconds
+            
+    #     Returns:
+    #         Load as a percentage (0-100)
+    #     """
+    #     sinusoidal_component = self.load_amplitude * math.sin(self.load_frequency * time_seconds + self.load_phase)
+    #     current_load = self.base_load + sinusoidal_component
+        
+    #     # Ensure load stays within reasonable bounds (0-100%)
+    #     return current_load
+
     def get_load_at_time(self, time_seconds):
         """
-        Calculate the load at a given time using a sinusoidal function.
+        Calculate the load at a given time using population density, local time, and noise.
         
         Args:
             time_seconds: Current simulation time in seconds
@@ -226,11 +292,16 @@ class Beam:
         Returns:
             Load as a percentage (0-100)
         """
-        sinusoidal_component = self.load_amplitude * math.sin(self.load_frequency * time_seconds + self.load_phase)
-        current_load = self.base_load + sinusoidal_component
+        base_density = self._pop_density_at(self.center_lat, self.center_lon)
+        if base_density is None:
+            base_density = self.base_load
+
+        local_hour = (Beam.start_utc_hour + time_seconds / 3600.0 + self.center_lon / 15.0) % 24.0
+        diurnal = 0.5 + 0.5 * math.cos(2 * math.pi * (local_hour - self.peak_local_hour) / 24.0)
+        current_load = (0.2 + 0.8 * base_density) * (0.3 + 0.7 * diurnal) + self.noise_state
         
         # Ensure load stays within reasonable bounds (0-100%)
-        return current_load
+        return min(max(current_load, 0.0), 1.0)
     
     def update_load(self, time_seconds):
         """
@@ -240,7 +311,7 @@ class Beam:
             time_seconds: Current simulation time in seconds
         """
         self.load = self.get_load_at_time(time_seconds)
-        self.capacity = self.max_capacity*(1 - self.load) 
+        self.capacity = self.max_capacity*(1 - self.load)
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -316,9 +387,9 @@ class Satellite:
         beam_height_km = side_km / n_beams  # ≈ 81.9 km
 
         deg_per_km = 1 / 111  # Approximate conversion
-        # add some tolerance to beam height and width 
-        beam_width_deg = (beam_width_km + 100) * deg_per_km
-        beam_height_deg = (beam_height_km + 50) * deg_per_km
+        # Add tolerance to beam size
+        beam_width_deg = (beam_width_km + beam_width_km*0.4) * deg_per_km
+        beam_height_deg = (beam_height_km + beam_height_km*0.4) * deg_per_km
 
         sat_lat = math.degrees(self.latitude)
         sat_lon = math.degrees(self.longitude)
@@ -351,6 +422,7 @@ class Satellite:
                 center_lat = sat_lat + dlat
                 center_lon = sat_lon + dlon
                 self.beams.append(Beam(center_lat, center_lon, beam_width_deg, beam_height_deg))
+
 
     def maxSlantRange(self):
         """
@@ -475,51 +547,93 @@ class Satellite:
         self.update_beams()
 
 
-def load_route_from_csv(filename, skip_rows=10):
+
+def load_route_from_csv(filename, skip_rows=0):
     """
     Loads the aircraft route from a CSV file, skipping the first and last N rows.
     Returns a list of dicts with keys: 'lat', 'lon', 'speed_mph'
+    Supports both original route format and interpolated route format.
     """
     route = []
     # Try utf-8-sig first, fallback to latin1 if error
     print("Loading flight route from csv")
     try:
-        with open(filename, newline='', encoding='utf-8-sig') as csvfile:
+        with open(filename, newline='', encoding='utf-8') as csvfile:
             reader = list(csv.DictReader(csvfile))
     except UnicodeDecodeError as e:
         print(f"UTF-8 decoding error: {e}. Trying latin1 encoding.")
         with open(filename, newline='', encoding='latin1') as csvfile:
             reader = list(csv.DictReader(csvfile))
+    
     # Ignore first and last skip_rows
-    data = reader[skip_rows:-skip_rows]
-    print(data)
+    data = reader[skip_rows:-skip_rows] if skip_rows > 0 else reader
+    
+    # Detect format based on column names
+    if not data:
+        print("No data found in CSV file")
+        return [], 0
+        
+    first_row = data[0]
+    is_interpolated_format = 'seconds' in first_row and 'latitude' in first_row
+    is_original_format = 'Latitude' in first_row and 'Time (EDT)' in first_row
+    
+    print(f"Detected format: {'Interpolated' if is_interpolated_format else 'Original' if is_original_format else 'Unknown'}")
+    
     for row in data:
         try:
-            lat = float(row['Latitude'])
-            lon = float(row['Longitude'])
-            speed = float(row['mph'])
-            altitude = float(row['feet'].replace(',', ''))  # Ensure altitude is float
-            time = pd.to_datetime(row['Time (EDT)'], format="%a %I:%M:%S %p")  # Time in seconds
-            route.append({'lat': lat, 'lon': lon, 'speed_mph': speed, 'alt': altitude, 'time': time})
+            if is_interpolated_format:
+                # Handle interpolated format (lowercase column names, different datetime format)
+                lat = float(row['latitude'])
+                lon = float(row['longitude'])
+                speed = float(row['speed_mph'])
+                altitude = float(row['altitude_ft'])
+                # Handle interpolated datetime format: "1900-01-01 10:48:57"
+                time = pd.to_datetime(row['datetime'], format="%Y-%m-%d %H:%M:%S")
+                route.append({'lat': lat, 'lon': lon, 'speed_mph': speed, 'alt': altitude, 'time': time})
+                
+            elif is_original_format:
+                # Handle original format (uppercase column names, different datetime format)
+                lat = float(row['Latitude'])
+                lon = float(row['Longitude'])
+                speed = float(row['mph'])
+                # Clean altitude field (remove commas and quotes)
+                altitude_str = row['feet'].replace(',', '').replace('"', '')
+                altitude = float(altitude_str)
+                # Handle original datetime format: "Tue 10:48:57 AM"
+                time = pd.to_datetime(row['Time (EDT)'], format="%a %I:%M:%S %p")
+                route.append({'lat': lat, 'lon': lon, 'speed_mph': speed, 'alt': altitude, 'time': time})
+                
+            else:
+                print(f"Unknown CSV format. Available columns: {list(row.keys())}")
+                break
+                
         except Exception as e:
             print(f"Skipping malformed row due to error: {e}")
+            print(f"Row data: {row}")
             continue  # skip malformed rows
-    route_duration = (route[-1]['time'] - route[0]['time']).total_seconds()
-    return route, route_duration 
+    
+    if len(route) > 0:
+        route_duration = (route[-1]['time'] - route[0]['time']).total_seconds()
+        print(f"Loaded {len(route)} route points. Duration: {route_duration:.1f} seconds")
+    else:
+        route_duration = 0
+        print("No valid route points loaded")
+        
+    return route, route_duration
+
 
 class Aircraft: 
-    def __init__(self, env, aircraft_id, route=None, height=10000, passengers = None):
-        self.deltaT = 0 
-        self.time = 0  # in seconds
+    def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1, passengers = None):
+        self.passengers = passengers 
+        self.time = 0 # in seconds 
+        self.deltaT = 1 
         self.env = env
         self.id = aircraft_id
-        self.passengers = passengers
-        #self.update_interval = update_interval
+        self.update_interval = update_interval
         self.Gr = 25 #dBi
 
         self.route = route or []
         self.route_index = 0
-        self.demand = 0 
 
         # Initialize position from route if available
         if self.route:
@@ -538,7 +652,16 @@ class Aircraft:
         self.current_snr = 0
         self.current_latency = 0
         self.handover_count = 0
+        self.min_dwell_s = 15.0
+        self.time_to_trigger_s = 10.0
+        self.service_drop_s = 2.0
+        self.last_handover_time = -float("inf")
+        self.ttt_candidate = None
+        self.ttt_candidate_sat = None
+        self.ttt_start_time = None
+        self.service_drop_until = 0.0
 
+        self.demand = 0 
         self.total_allocated_bandwidth = 0.0  # Total allocated bandwidth (MB)
         self.allocation_ratios = []
         self.total_demand = 0 
@@ -570,7 +693,9 @@ class Aircraft:
         FSPL_dB = 20 * math.log10(d_m) + 20 * math.log10(f_Hz) - 147.55
 
         # Received power in dBW
-        Pr_dBW = Pt_dBW + Gt_dBi + Gr_dBi - FSPL_dB
+        off_axis = beam.off_axis_gain_db(self.latitude, self.longitude)
+        Gt_dBi_effective = Gt_dBi + off_axis
+        Pr_dBW = Pt_dBW + Gt_dBi_effective + Gr_dBi - FSPL_dB
 
         # Noise power in dBW
         N_dBW = 10 * math.log10(k * T * B_Hz)
@@ -579,7 +704,7 @@ class Aircraft:
         SNR_dB = Pr_dBW - N_dBW
         return SNR_dB
 
-    def scan_nearby_fast(self, constellation, threshold_km=10000):
+    def scan_nearby_fast(self, constellation, threshold_km=1000):
         """
         Returns a list of all beams where the aircraft is inside the footprint.
         Each entry is a dict with beam, satellite, SNR, load, capacity, etc.
@@ -591,47 +716,38 @@ class Aircraft:
                 for beam in sat.beams:
                     beam_coords.append([beam.center_lat, beam.center_lon])
                     beam_refs.append((sat, beam))
-
+        
         if not beam_refs:
-            return None, -np.inf
+            return []
 
         beam_coords = np.array(beam_coords)
-
-        # Build KDTree
         tree = KDTree(beam_coords)
-
-        # Query for all beams within threshold (in degrees, approx)
         threshold_deg = threshold_km / 111.0
         idxs = tree.query_ball_point([self.latitude, self.longitude], r=threshold_deg)
 
-        best_snr = -np.inf
-        best_candidate_beam = None
-        best_candidate_sat = None
-
-        #print(f"\n[SimTime {self.env.now:.2f}] Aircraft {self.id} scan:")
+        candidates = []
         for idx in idxs:
             sat, beam = beam_refs[idx]
-            
-            # Use 3D distance for SNR calculation
             dist_3d = self._calculate_3d_distance(sat)
             snr = self.calculate_snr(beam, dist_3d / 1000) # distance in km
-            
-            # Check if aircraft is within the beam's elliptical footprint
             aircraft_point = Point(self.longitude, self.latitude)
             if beam.get_footprint().intersects(aircraft_point) or beam.get_footprint().contains(aircraft_point):
-                 #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (In Footprint)")
-                 if snr > best_snr:
-                    best_snr = snr
-                    best_candidate_beam = beam
-                    best_candidate_sat = sat
-            #else:
-                 #print(f"  - Beam {beam.id} on Sat {sat.ID} | Distance: {dist_3d/1000:.2f} km | SNR: {snr:.2f} dB (Outside Footprint)")
+                candidates.append({
+                    'sat': sat,
+                    'beam': beam,
+                    'snr': snr,
+                    'distance_km': dist_3d / 1000,
+                    'load': beam.load,
+                    'capacity': beam.capacity,
+                    'beam_id': beam.id,
+                    'sat_id': sat.ID
+                })
+        print(f"candidates found: {len(candidates)}")
+        return candidates
 
-        return best_candidate_sat, best_candidate_beam, best_snr
-
-    def scan_nearby(self, earth, threshold_km=500):
+    def scan_nearby(self, constellation, threshold_km=500):
         results = []
-        for plane in earth.LEO:
+        for plane in constellation:
             for sat in plane.sats:
                 sat_dist = geopy.distance.distance(
                     (self.latitude, self.longitude),
@@ -657,15 +773,6 @@ class Aircraft:
                         })
         return results
 
-    def scan_at_intervals(self, env, earth, interval=10, threshold_km=500):
-        #while True:
-        scan_results = self.scan_nearby_fast(earth, threshold_km=threshold_km)
-        print(f"\n[SimTime {env.now}] Aircraft {self.ID} scan:")
-        for result in scan_results:
-            if result['type'] == 'beam':
-                print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
-            #yield env.timeout(interval)
-
     def get_demand_at_time(self, deltaT):
         """
         Calculate the aircraft's demand at a given time using a random function.
@@ -676,7 +783,7 @@ class Aircraft:
         demand_per_user = [random.uniform(0, 25) for _ in range(num_users)]  # 2–25 Mbps per user
         total_demand = sum(demand_per_user)
         self.total_demand += (total_demand*deltaT)/8
-        return (total_demand*deltaT)/8 #Total data transferred in megabytes   
+        return (total_demand*deltaT)/8  
 
     def update_demand(self, deltaT):
         """
@@ -684,8 +791,8 @@ class Aircraft:
         Args:
             time_seconds: Current simulation time in seconds
         """
-        self.demand = self.get_demand_at_time(deltaT)    
-    
+        self.demand = self.get_demand_at_time(deltaT)   
+
     def step_passengers(self, deltaT):
         if self.passengers:
             total_throughput = 0
@@ -705,6 +812,8 @@ class Aircraft:
         
         Args:
             data_size_mb: Size of the data to be transmitted in megabytes  """ 
+        if self._service_drop_active():
+            return 1000, 0   
         
         if self.connected_beam is None: 
             return 1000, 0   # No connection means infinite delay
@@ -728,12 +837,14 @@ class Aircraft:
             delay_seconds = backlog_Mb / (transmission_rate_mbps)   # Convert MB to Mb for calculation
 
         return delay_seconds, transmission_rate_mbps
-
+    
     def allocation_ratio(self, deltaT):
         """
         Returns the ratio of allocated throughput to total demand for the current time step.
         Throughput is limited by the available beam capacity.
         """
+        if self._service_drop_active():
+            return 0, 0.0, self.demand, 0.0
         # Update demand for this timestep
         #self.update_demand(deltaT)
         #demand = self.demand  # in MB (as per your get_demand_at_time)
@@ -765,7 +876,11 @@ class Aircraft:
         self.allocation_ratios.append(ratio)            
 
         return ratio, allocated, self.demand, beam_capacity_MB   
-    
+
+    def _service_drop_active(self):
+        sim_time = self.env.now if hasattr(self.env, "now") else self.time
+        return sim_time < self.service_drop_until
+
     def get_qoe_metrics(self, deltaT):
         """
         Returns qoe metrics based on passenger usage
@@ -774,6 +889,16 @@ class Aircraft:
         ratio, allocated, demand, beam_capacity_MB = self.allocation_ratio(deltaT) 
         queing_delay, transmission_rate_mbps = self.queing_delay(deltaT)
         propagation_latency = self._calculate_latency()*2 # Round trip latency
+        sim_time = self.env.now if hasattr(self.env, "now") else self.time
+        if self.service_drop_until > sim_time:
+            service_drop_s = min(deltaT, self.service_drop_until - sim_time)
+        else:
+            service_drop_s = 0.0
+        dwell_remaining_s = max(0.0, self.min_dwell_s - (sim_time - self.last_handover_time))
+        if self.ttt_start_time is None:
+            ttt_remaining_s = 0.0
+        else:
+            ttt_remaining_s = max(0.0, self.time_to_trigger_s - (sim_time - self.ttt_start_time))
         return {
             'allocation_ratio': ratio,
             'allocated_bandwidth_MB': allocated,
@@ -784,7 +909,10 @@ class Aircraft:
             'propagation_latency_s': propagation_latency, 
             'throughput_req_mbps': total_throughput_required, 
             'latency_req_s': max_latency_allowed/1000, # convert ms to s 
-            'SNR_dB': self.current_snr
+            'SNR_dB': self.current_snr,
+            'service_drop_s': service_drop_s,
+            'dwell_remaining_s': dwell_remaining_s,
+            'ttt_remaining_s': ttt_remaining_s
         }
 
     def time_between_points(self, lat1, lon1, lat2, lon2, speed_kmph):
@@ -797,7 +925,7 @@ class Aircraft:
             return float('inf')  # Avoid division by zero
         time_hours = distance_km / speed_kmph
         return time_hours
-
+     
     def _update_position(self):
         """
         Updates aircraft's latitude, longitude, and speed from the route.
@@ -819,44 +947,77 @@ class Aircraft:
             return deltaT_seconds
         # If not using a route, you could implement the old logic here (with direction), but skip for real route.
 
-    def move_and_connect_aircraft(self, earth_instance):
+    def move_and_connect_aircraft(self, constellation):
 
         # 1. Move the aircraft
-        deltaT = self._update_position() 
-        self.deltaT = deltaT
+        deltaT = self._update_position()
+        self.deltaT = deltaT 
+        print(f"self.deltaT: {self.deltaT}")
+        sim_time = self.env.now if hasattr(self.env, "now") else self.time
 
         # 2. Find the best beam using the efficient KDTree scan
-        best_candidate_sat, best_candidate_beam, best_snr = self.scan_nearby_fast(earth_instance.LEO)
-
-        # 3. Manage connection and handover
-        if best_candidate_beam and best_candidate_beam != self.connected_beam:
-            # Handover or initial connection
+        candidates = self.scan_nearby_fast(constellation)  
+        if not candidates:
             if self.connected_beam:
-                self.handover_count += 1
-                print(f"Time {self.env.now:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
-            else:
-                print(f"Time {self.env.now:.2f}: Aircraft {self.id} CONNECTED to {best_candidate_beam.id} (Initial connection)")
-
-            # Connect to new beam
-            self.connected_beam = best_candidate_beam
-            self.connected_satellite = best_candidate_sat
-            self.current_snr = best_snr
-            self.current_latency = self._calculate_latency() # Update latency
-            print(f"  >> New Status: SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms, Beam Load: {self.connected_beam.load}, Beam Capacity:{self.connected_beam.capacity}")
-
-        elif not best_candidate_beam and self.connected_beam:
-            # Lost connection
-            print(f"Time {self.env.now:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
+                print(f"Time {sim_time:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
             self.connected_beam = None
             self.connected_satellite = None
             self.current_snr = -100
             self.current_latency = 0
+            self.ttt_candidate = None
+            self.ttt_candidate_sat = None
+            self.ttt_start_time = None
+            return deltaT
 
-        elif best_candidate_beam and best_candidate_beam == self.connected_beam:
-            # Still connected to the same beam, just update SNR/latency
+        best = max(candidates, key=lambda c: c["snr"])
+        best_candidate_sat = best["sat"]
+        best_candidate_beam = best["beam"]
+        best_snr = best["snr"]
+
+        if self.connected_beam is None:
+            print(f"Time {sim_time:.2f}: Aircraft {self.id} CONNECTED to {best_candidate_beam.id} (Initial connection)")
+            self.connected_beam = best_candidate_beam
+            self.connected_satellite = best_candidate_sat
             self.current_snr = best_snr
             self.current_latency = self._calculate_latency()
-            print(f"Time {self.env.now:.2f}: Aircraft {self.id} remains connected to {self.connected_beam.id}. SNR: {self.current_snr:.2f} dB, Latency: {self.current_latency*1e3:.2f} ms")   
+            self.last_handover_time = sim_time
+            return deltaT
+
+        if best_candidate_beam == self.connected_beam:
+            self.current_snr = best_snr
+            self.current_latency = self._calculate_latency()
+            self.ttt_candidate = None
+            self.ttt_candidate_sat = None
+            self.ttt_start_time = None
+            return deltaT
+
+        current_snr_now = self.calculate_snr(self.connected_beam, self._calculate_3d_distance(self.connected_satellite) / 1000)
+        self.current_snr = current_snr_now
+        self.current_latency = self._calculate_latency()
+
+        if sim_time - self.last_handover_time < self.min_dwell_s:
+            return deltaT
+
+        if self.ttt_candidate != best_candidate_beam:
+            self.ttt_candidate = best_candidate_beam
+            self.ttt_candidate_sat = best_candidate_sat
+            self.ttt_start_time = sim_time
+            return deltaT
+
+        if sim_time - self.ttt_start_time < self.time_to_trigger_s:
+            return deltaT
+
+        self.handover_count += 1
+        print(f"Time {sim_time:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
+        self.connected_beam = best_candidate_beam
+        self.connected_satellite = best_candidate_sat
+        self.current_snr = best_snr
+        self.current_latency = self._calculate_latency()
+        self.last_handover_time = sim_time
+        self.service_drop_until = sim_time + self.service_drop_s
+        self.ttt_candidate = None
+        self.ttt_candidate_sat = None
+        self.ttt_start_time = None
 
         return deltaT 
 
@@ -916,7 +1077,7 @@ class Passenger:
         
         # 2) If idle, maybe start a new app
         if self.application is None:
-            start_prob = 0.5  # 5% chance per 10 seconds
+            start_prob = 0.5  # 50% chance per 10 seconds
             if random.random() < start_prob:
                 apps  = list(self.APP_PROBS.keys())
                 probs = list(self.APP_PROBS.values())
@@ -1054,13 +1215,13 @@ class VideoConferenceApp:
         if self.session_active():
             return self.base_demand_mbps
         else:
-            return 0
+            return 0            
 
 # Earth consisting of cells
 class Earth:
-    def __init__(self, env,  constellation, aircraft, window=None):
-        self.deltaT = 0
-
+    def __init__(self, env, constellation, aircraft, window=None):
+        self.deltaT = 0 
+        
         [self.total_x, self.total_y] = [1920, 906]
 
         self.total_cells = self.total_x * self.total_y
@@ -1087,14 +1248,9 @@ class Earth:
         self.LEO = create_Constellation(constellation, env)
         # create aircrafts 
         self.aircraft = aircraft 
-
-        # After moving the satellites within the constellation, the aircrafts need to scan for nearby beams 
-        #self.step_aircraft = env.process(self.step_aircraft(env, threshold_km=500))
-
-        # Simpy process for handling moving the constellation and the satellites within the constellation
-        #self.moveConstellation = env.process(self.moveConstellation(env, 10))
-        self.env = env
+        self.env = env  # simpy environment
         self.img_count = 0
+        self.Training = True
 
     def set_window(self, window):  # function to change/set window for the earth
         """
@@ -1105,35 +1261,20 @@ class Earth:
         self.windowx = ((int)((0.5 + window[0] / 360) * self.total_x), (int)((0.5 + window[1] / 360) * self.total_x))
         self.windowy = ((int)((0.5 - window[3] / 180) * self.total_y), (int)((0.5 - window[2] / 180) * self.total_y))
 
-
     def advance_constellation(self, deltaT, env_time):
         # rotate constellation and satellites
         for constellation in self.LEO:
             constellation.rotate(deltaT, env_time)
-
-    def step_aircraft(self, env, threshold_km=500):
-        """
-        SimPy process: At each interval, all aircraft scan, update demand, and calculate allocation.
-        """
-        #while True:
+  
+    def step_aircraft(self, folder="PPO"):
         for ac in self.aircraft:
-            #scan_results = ac.scan_nearby_fast(self, threshold_km=threshold_km)
-            deltaT = ac.move_and_connect_aircraft(self)  # Move aircraft and manage connections
-            self.deltaT = deltaT
-            #ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
-            qoe_metrics = ac.get_qoe_metrics(deltaT)
-            ratio = qoe_metrics['allocation_ratio']
-            allocated = qoe_metrics['allocated_bandwidth_MB']
-            demand = qoe_metrics['demand_MB']
-            beam_capacity_MB = qoe_metrics['beam_capacity_MB']
-            print(f"\n[SimTime {env.now}] Aircraft {ac.id} scan:")
-            # for result in scan_results:
-            #     if result['type'] == 'beam':
-            #         print(f"Beam {result['beam_id']} on Satellite {result['sat_id']} | Distance: {result['distance_km']:.2f} km | SNR: {result['snr_db']:.2f} dB")
-            print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
-        #self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft)  
-            #yield env.timeout(deltaT)  
-            return qoe_metrics            
+            deltaT = ac.move_and_connect_aircraft(self.LEO)
+            self.deltaT = deltaT 
+            ratio, allocated, demand, beam_capacity_MB = ac.allocation_ratio(deltaT)
+            #print(f"Aircraft {ac.id} scan:")
+            #print(f"Allocation ratio: {ratio:.2f} | Allocated: {allocated:.2f} MB | Demand: {demand:.2f} MB | Beam cap: {beam_capacity_MB:.2f} MB")
+        if self.Training == False: 
+            self.save_plot(self.env, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=self.aircraft, folder=folder)             
 
     def plotMap(self, plotSat = True, plotBeams = True, plotAircrafts = True, aircrafts=None, selected_beam_id=None, path = None, bottleneck = None):
         print("Plotting map")
@@ -1279,21 +1420,17 @@ class Earth:
         ax.scatter(xs, ys, zs, marker='o')
         plt.show()
 
-    def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None):
-        save_dir = "simulationImages/Baseline"
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+    def save_plot(self, env, plotSat=True, plotBeams=True, plotAircrafts=False, aircrafts=None, folder = "PPO"):
+        if not os.path.exists("simulationImages"):
+            os.makedirs("simulationImages")
         print(f"\nSaving plot {self.img_count} at simulation time {env.now}")
+        # Get the ID of the connected beam for highlighting
         selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
         self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
-        filename = os.path.join(save_dir, f"sat_positions_{self.img_count}.png")
-        try:
-            plt.savefig(filename)
-        except Exception as e:
-            print(f"Error saving plot: {e} (filename: {filename})")
+        plt.savefig(f"simulationImages/{folder}/sat_positions_{self.img_count}.png")
         plt.close()
-        self.img_count += 1 
-    
+        self.img_count += 1          
+
     def __repr__(self):
         return 'total divisions in x = {}\n total divisions in y = {}\n total cells = {}\n window of operation ' \
                '(longitudes) = {}\n window of operation (latitudes) = {}'.format(
@@ -1328,12 +1465,13 @@ def initialize(env, constellationType, route):
     passenger3 = Passenger("P-003")
     passenger4 = Passenger("P-004")
     passenger5 = Passenger("P-005")
-
-    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, passengers=[passenger1, passenger2, passenger3, passenger4, passenger5])  # Example aircraft with route and passenger 
+    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10, passengers=[passenger1, passenger2, passenger3, passenger4, passenger5])
+    # aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=8000000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, constellationType, [aircraft1])
 
     print("Initialized Earth")
     print(earth)
+    print()
 
     return earth
 
@@ -1427,144 +1565,9 @@ def create_Constellation(specific_constellation, env):
 
     return orbital_planes
 
-class LEOEnv(gym.Env):
-    """
-    Gymnasium environment wrapper for the LEO satellite handover simulation.
-    """
 
-    def __init__(self, constellation_name, route):
-        super(LEOEnv, self).__init__()
-
-        # We'll set a placeholder action space, but update it dynamically
-        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
-
-        # Observation space: [aircraft_lat, aircraft_lon, snr, beam_load, beam_capacity]
-        low = np.array([-90, -180, -100, 0, 0], dtype=np.float32)
-        high = np.array([90, 180, 100, 100, 1000], dtype=np.float32)
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-
-        self.constellation = constellation_name 
-        self.route = route 
-        self.deltaT = 1
-
-        self.env = None
-        self.earth = None
-        self.aircraft = None
-        self.current_step = 0
-
-        self.available_beams = []  # List of available beams for current step
-
-        np.random.seed(42)
-        random.seed(42)
-
-        self._setup_simulation()
-
-    def _setup_simulation(self):
-
-        self.env = simpy.Environment()
-        self.earth = initialize(self.env, self.constellation, self.route)
-        self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
-        self.current_step = 0
-
-        # Build global beam id list and mapping
-        self.all_beam_ids = []
-        self.beam_id_to_obj = {}
-        for plane in self.earth.LEO:
-            for sat in plane.sats:
-                for beam in sat.beams:
-                    self.all_beam_ids.append(beam.id)
-                    self.beam_id_to_obj[beam.id] = beam
-
-        self.action_space = spaces.Discrete(len(self.all_beam_ids))
-
-        # Find available beams for the initial state
-        self.available_beams = self._get_available_beams()
-
-    def _get_available_beams(self):
-        # Returns a list of candidate beams (dicts) from scan_nearby_fast
-        return self.aircraft.scan_nearby_fast(self.earth.LEO)
-    
-    def _get_action_mask(self):
-        mask = np.zeros(len(self.all_beam_ids), dtype=bool)
-        available_ids = [b['beam'].id for b in self.available_beams]
-        for i, beam_id in enumerate(self.all_beam_ids):
-            if beam_id in available_ids:
-                mask[i] = True
-        return mask    
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        np.random.seed(42)
-        random.seed(42)
-        self._setup_simulation()
-        obs = self._get_obs()
-        info = {
-            "available_beams": self.available_beams,
-        }
-        return obs, info
-
-    def step(self):
-
-        # Advance simulation
-        qoe_metrics = self.earth.step_aircraft(self.env)
-        self.earth.advance_constellation(self.earth.deltaT, self.env.now)
-        
-        self.env.run(until=self.env.now + self.earth.deltaT)
-        self.current_step += 1
-
-        # Update available beams for next step
-        self.available_beams = self._get_available_beams()
-
-        obs = self._get_obs()
-        base_reward = self._get_reward()
-        final_reward = base_reward 
-        print(f"Current simulation step: {self.current_step}")
-        terminated = False 
-        truncated = False 
-        if self.current_step >= len(self.route) - 1:
-            terminated = True
-        
-        info = {
-            "available_beams": self.available_beams,
-        }
-
-        print(f"final reward: {final_reward}, base reward: {base_reward}")
-
-        return obs, final_reward, terminated, truncated, info
-
-    def _get_obs(self):
-        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
-        ac = self.aircraft
-        lat = ac.latitude
-        lon = ac.longitude
-        alt = ac.height
-        handovers = ac.handover_count
-        load = ac.connected_beam.load if ac.connected_beam else 0
-        snr = qoe['SNR_dB'] if qoe and 'SNR_dB' in qoe else -100
-        allocated_bw = qoe['allocated_bandwidth_MB'] if qoe and 'allocated_bandwidth_MB' in qoe else 0
-        allocation_ratio = qoe['allocation_ratio'] if qoe and 'allocation_ratio' in qoe else 0
-        demand_MB = qoe['demand_MB'] if qoe and 'demand_MB' in qoe else 0
-        throughput_req = qoe['throughput_req_mbps'] if qoe and 'throughput_req_mbps' in qoe else 0
-        queing_delay_s = qoe['queuing_delay_s'] if qoe and 'queuing_delay_s' in qoe else 0
-        propagation_latency_s = qoe['propagation_latency_s'] if qoe and 'propagation_latency_s' in qoe else 0
-        transmission_rate_mbps = qoe['transmission_rate_mbps'] if qoe and 'transmission_rate_mbps' in qoe else 0
-        latency_req_s = qoe['latency_req_s'] if qoe and 'latency_req_s' in qoe else 0
-        beam_capacity = qoe['beam_capacity_MB'] if qoe and 'beam_capacity_MB' in qoe else 0
-        
-        return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity], dtype=np.float32)
-
-    def _get_reward(self):
-        if self.aircraft.allocation_ratios:
-            return self.aircraft.allocation_ratios[-1]
-        return 0.0
-
-    def render(self):
-        if self.earth:
-            self.earth.plotMap(plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=[self.aircraft])
-
-    def close(self): 
-        pass
-
+# Global variable to store the earth instance, so Aircraft class can access it
+earth_instance = None
 
 def main():
     """
@@ -1572,12 +1575,6 @@ def main():
     can be an issue.
     """
     global earth_instance # Declare as global
-
-    # Create a dummy input.csv if it doesn't exist
-    if not os.path.exists("input.csv"):
-        with open("input.csv", "w") as f:
-            f.write("Test length,Constellation\n")
-            f.write("100,OneWeb\n")
 
 
     inputParams = pd.read_csv("input.csv")
@@ -1594,10 +1591,7 @@ def main():
     print(f"Simulation test length: {simulationTimelimit} seconds")
 
     env = simpy.Environment()
-
     route, route_duration = load_route_from_csv('route.csv', skip_rows=3)
-    print(route)
-
     earth_instance = initialize(env, constellation_name, route)
 
     # --- Aircraft Simulation ---
@@ -1607,7 +1601,7 @@ def main():
     # plotAircrafts is set to True to show aircraft on the map
     #env.process(earth_instance.save_plot_at_intervals(env, interval=movementTime, plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=all_aircrafts))
 
-    #progress = env.process(simProgress(route_duration, env))
+    #progress = env.process(simProgress(simulationTimelimit, env))
     startTime = time.time()
     env.run(route_duration)
     timeToSim = time.time() - startTime
@@ -1626,6 +1620,5 @@ def main():
             print(f"Aircraft '{aircraft.id}' ended the simulation with no connection.")
 
 
-    
 if __name__ == '__main__':
     main()

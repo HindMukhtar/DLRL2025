@@ -33,12 +33,12 @@ def append_observation_to_file(obs, step, model_name, filename):
     # Create header if file doesn't exist
     if not os.path.exists(filename):
         with open(filename, 'w') as f:
-            f.write("step, lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity\n")
+            f.write("step, lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s\n")
     
     # Append observation data
     with open(filename, 'a') as f:
         
-        f.write(f"{step},{obs[0]},{obs[1]},{obs[2]},{obs[3]},{obs[4]},{obs[5]},{obs[6]},{obs[7]},{obs[8]},{obs[9]},{obs[10]},{obs[11]},{obs[12]},{obs[13]},{obs[14]}\n")
+        f.write(f"{step},{obs[0]},{obs[1]},{obs[2]},{obs[3]},{obs[4]},{obs[5]},{obs[6]},{obs[7]},{obs[8]},{obs[9]},{obs[10]},{obs[11]},{obs[12]},{obs[13]},{obs[14]},{obs[15]},{obs[16]},{obs[17]}\n")
     
     # Periodic garbage collection every 100 steps to manage memory
     if step % 100 == 0:
@@ -48,9 +48,10 @@ print(f"Selected Model for Testing: {SELECTED_MODEL}")
 print("=" * 50)
 
 # Initialize common parameters
-inputParams = pd.read_csv("input.csv")
+base_dir = os.path.dirname(__file__)
+inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
 constellation_name = inputParams['Constellation'][0]
-route, route_duration = load_route_from_csv('route_1s_interpolated_short.csv', skip_rows=3)
+route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
 
 # Initialize only the selected model and environment
 if SELECTED_MODEL == 'PPO':
@@ -106,6 +107,8 @@ print("=" * 50)
 done = False
 step_count = 0
 results_filename = f'{SELECTED_MODEL}_observations.csv'
+if os.path.exists(results_filename):
+    os.remove(results_filename)
 
 # Reset environment
 if SELECTED_MODEL == 'BASELINE':
@@ -125,13 +128,13 @@ while not done:
     # Take action based on selected model
     if SELECTED_MODEL == 'BASELINE':
         obs, reward, done, truncated, info = env.step()
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14]]  # SNR, load, capacity, handovers, total allocated bw,  allocation
+        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]  # SNR, load, capacity, handovers, total allocated bw,  allocation
     elif SELECTED_MODEL == 'ODT':
         mask = env.env._get_action_mask()
         action = predict_fn(agent, obs, mask)
         obs, reward, done, truncated, info = env.step(action)
         agent.step(obs, action, reward, obs, done or truncated)
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14]]
+        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
     else:  # PPO or DQN
         mask = env.env._get_action_mask()
         action = predict_fn(agent, obs, mask)
@@ -139,7 +142,7 @@ while not done:
             obs, reward, done, truncated, info = env.step(action)
         else:  # PPO
             obs, reward, done, truncated, info = env.env.step(action)
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14]]
+        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
     
     # Append observation to file immediately
     append_observation_to_file(observation_data, step_count, SELECTED_MODEL, results_filename)
@@ -173,4 +176,3 @@ print("- Single model execution")
 print("- Real-time file appending (no memory accumulation)")
 print("- Periodic garbage collection")
 print("- No step limit - full route completed")
-
