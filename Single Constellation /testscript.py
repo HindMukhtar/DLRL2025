@@ -59,7 +59,7 @@ if SELECTED_MODEL == 'PPO':
     env = LEOEnvPPO(constellation_name, route)
     env = ActionMasker(env, mask_fn)
     agent = MaskablePPO("MlpPolicy", env, verbose=0)
-    agent.load("handover_ppo_agent")
+    agent.load(os.path.join(base_dir, "handover_ppo_agent"))
     env.env.earth.Training = False
     predict_fn = predict_valid_action
     
@@ -68,7 +68,7 @@ elif SELECTED_MODEL == 'DQN':
     env = LEOEnvDQN(constellation_name, route)
     env = ActionMasker(env, mask_fn)
     agent = DQN("MlpPolicy", env, verbose=0, buffer_size=50)
-    agent.load("handover_dqn_agent")
+    agent.load(os.path.join(base_dir, "handover_dqn_agent"))
     env.env.earth.Training = False
     predict_fn = predict_valid_action_dqn
     
@@ -84,7 +84,7 @@ elif SELECTED_MODEL == 'ODT':
         num_layers=2,
         target_return=1.0
     )
-    model_path = 'decision_transformer_final.pth'
+    model_path = os.path.join(base_dir, "decision_transformer_final.pth")
     agent.load(model_path)
     env.env.earth.Training = False
     predict_fn = predict_valid_action_dt

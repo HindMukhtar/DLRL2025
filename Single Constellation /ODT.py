@@ -11,7 +11,15 @@ from LEOEnvironmentRL import initialize, load_route_from_csv
 from HandoverEnvironment import mask_fn
 from sb3_contrib.common.wrappers import ActionMasker
 import pandas as pd
+import os
 import simpy
+
+def _get_default_device() -> str:
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 class DecisionTransformerBlock(nn.Module):
     """Single transformer block for Decision Transformer"""
@@ -51,7 +59,7 @@ class DecisionTransformerModel(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
-        max_length: int = 20,
+        max_length: int = 10,
         embed_dim: int = 128,
         num_layers: int = 3,
         num_heads: int = 4,
@@ -261,16 +269,17 @@ class OnlineDecisionTransformer:
         self,
         state_dim: int,
         action_dim: int,
-        max_length: int = 20,
+        max_length: int = 10,
         embed_dim: int = 128,
         num_layers: int = 3,
         num_heads: int = 4,
         learning_rate: float = 1e-4,
         target_return: float = 1.0,
         buffer_size: int = 50,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device: Optional[str] = None
     ):
-        self.device = device
+        self.device = device or _get_default_device()
+        print(f"ODT device: {self.device}")
         self.max_length = max_length
         self.target_return = target_return
         self.eval_mode = False  # Add evaluation mode flag
@@ -286,7 +295,7 @@ class OnlineDecisionTransformer:
             embed_dim=embed_dim,
             num_layers=num_layers,
             num_heads=num_heads
-        ).to(device)
+        ).to(self.device)
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
@@ -820,7 +829,7 @@ class LEOEnvDecisionTransformer(gym.Env):
         self.dt_agent = OnlineDecisionTransformer(
             state_dim=self.observation_space.shape[0],
             action_dim=self.action_space.n,
-            max_length=120,
+            max_length=10,
             embed_dim=64,
             num_layers=2,
             target_return=1.0
@@ -861,9 +870,10 @@ def predict_valid_action_dt(agent, obs, mask):
 def main():
     """Main training loop for Online Decision Transformer"""
     # Setup environment
-    inputParams = pd.read_csv("input.csv")
+    base_dir = os.path.dirname(__file__)
+    inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_5s_interpolated.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
     
     # Create the base environment first (no model loading for training from scratch)
     base_env = LEOEnvDecisionTransformer(constellation_name, route, model_path=None)
@@ -872,7 +882,7 @@ def main():
     env = ActionMasker(base_env, mask_fn)
     
     # Training parameters
-    num_episodes = 100000
+    num_episodes = 10000
     train_interval = 5  # Train every 5 episodes
     
     print("Starting Online Decision Transformer training...")

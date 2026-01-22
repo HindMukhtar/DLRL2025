@@ -13,9 +13,10 @@ import gc  # Add garbage collection
 
 def main(): 
     # Create the environment
-    inputParams = pd.read_csv("input.csv")
+    base_dir = os.path.dirname(__file__)
+    inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = inputParams['Constellation'][0]
-    route, route_duration = load_route_from_csv('route_5s_interpolated.csv', skip_rows=0)
+    route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
 
     env = LEOEnv(constellation_name, route)
     env = ActionMasker(env, mask_fn)
@@ -23,7 +24,7 @@ def main():
 
     # Create memory-efficient ODT model for evaluation only
     model = OnlineDecisionTransformer(
-            state_dim=env.observation_space.shape[0],
+            state_dim=15,
             action_dim=env.action_space.n,
             max_length=20,
             embed_dim=64,
@@ -33,7 +34,7 @@ def main():
         )
     
     # Load pretrained ODT model 
-    model_path = 'decision_transformer_final.pth'
+    model_path = os.path.join(base_dir, '..', 'R1_models', 'decision_transformer_final.pth')
     model.load(model_path)
     
     # Enable evaluation mode to prevent memory accumulation
@@ -44,6 +45,7 @@ def main():
 
     # Evaluation with minimal debugging
     obs, info = env.reset()
+    dt_obs = obs[:15]
 
     # set training to false to enable saving plots 
     env.env.earth.Training = False
@@ -62,14 +64,16 @@ def main():
         mask = env.env._get_action_mask()
         
         # Predict action (no debugging prints)
-        action = predict_valid_action_dt(model, obs, mask)
+        action = predict_valid_action_dt(model, dt_obs, mask)
         
         next_obs, reward, done, truncated, info = env.step(action)
         
         # This will be skipped automatically in evaluation mode
-        model.step(obs, action, reward, next_obs, done or truncated)
+        next_dt_obs = next_obs[:15]
+        model.step(dt_obs, action, reward, next_dt_obs, done or truncated)
         
         obs = next_obs
+        dt_obs = next_dt_obs
         step_count += 1
         
         # Periodic memory cleanup
