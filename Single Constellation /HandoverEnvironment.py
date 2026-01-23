@@ -13,6 +13,13 @@ import random
 
 import sb3_contrib
 
+def _get_default_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
 class LEOEnv(gym.Env):
     """
     Gymnasium environment wrapper for the LEO satellite handover simulation.
@@ -248,6 +255,8 @@ class LEOEnv(gym.Env):
         # Optional: handover penalty if you track it
         if self.handover_occurred:
             reward -= 0.1
+        service_drop_s = qoe.get("service_drop_s", 0.0)
+        reward -= 0.02 * service_drop_s
 
         return float(reward)
 
@@ -299,7 +308,9 @@ def main():
     env = ActionMasker(env, mask_fn)
 
     # Create the DQN agent
-    model = MaskablePPO("MlpPolicy", env, verbose=1)
+    device = _get_default_device()
+    print(f"PPO device: {device}")
+    model = MaskablePPO("MlpPolicy", env, verbose=1, device=device)
     # Train the agent
     model.learn(total_timesteps=10000)
 

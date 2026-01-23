@@ -12,6 +12,13 @@ import torch
 import random
 
 import sb3_contrib
+
+def _get_default_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 print(dir(sb3_contrib))
 
 class LEOEnv(gym.Env):
@@ -250,6 +257,8 @@ class LEOEnv(gym.Env):
         # Optional: handover penalty if you track it
         if self.handover_occurred:
             reward -= 0.05
+        service_drop_s = qoe.get("service_drop_s", 0.0)
+        reward -= 0.02 * service_drop_s
 
         return float(reward)
 
@@ -294,7 +303,9 @@ def main():
 
     # Create the DQN agent
     #model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32)
-    model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32)
+    device = _get_default_device()
+    print(f"DQN device: {device}")
+    model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32, device=device)
     # Call once just to initialize everything 
     model.learn(total_timesteps=1)
     # Train the agent

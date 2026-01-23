@@ -801,6 +801,8 @@ class LEOEnv(gym.Env):
         # Optional: handover penalty if you track it
         if self.handover_occurred == True:
             reward -= 0.1
+        service_drop_s = qoe.get("service_drop_s", 0.0)
+        reward -= 0.02 * service_drop_s
 
         return float(reward)
 

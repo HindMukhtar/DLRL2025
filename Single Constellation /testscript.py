@@ -26,7 +26,7 @@ import gc  # Add garbage collection
 # MODEL SELECTION - Choose which model to test
 # ==============================================
 # Options: 'ODT', 'DQN', 'PPO', 'BASELINE'
-SELECTED_MODEL = 'BASELINE'  # Default: ODT
+SELECTED_MODEL = 'PPO'  # Default: ODT
 
 def append_observation_to_file(obs, step, model_name, filename):
     """Append single observation to file"""
@@ -76,15 +76,21 @@ elif SELECTED_MODEL == 'ODT':
     print("Loading ODT Agent...")
     env = LEOEnvODT(constellation_name, route)
     env = ActionMasker(env, mask_fn)
+    model_path = os.path.join(base_dir, "decision_transformer_offline.pth")
+    checkpoint = torch.load(model_path, map_location="cpu")
+    state_dim = checkpoint["model_state_dict"]["state_embedding.weight"].shape[1]
+    action_dim = checkpoint["model_state_dict"]["action_embedding.weight"].shape[0]
+    odt_state_dim = state_dim
+    odt_action_dim = action_dim
     agent = OnlineDecisionTransformer(
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.n,
-        max_length=20,
-        embed_dim=64,  
-        num_layers=2,
-        target_return=1.0
+        state_dim=state_dim,
+        action_dim=action_dim,
+        max_length=10,
+        embed_dim=32,
+        num_layers=1,
+        target_return=1.0,
+        buffer_size=150
     )
-    model_path = os.path.join(base_dir, "decision_transformer_final.pth")
     agent.load(model_path)
     env.env.earth.Training = False
     predict_fn = predict_valid_action_dt
@@ -130,10 +136,10 @@ while not done:
         obs, reward, done, truncated, info = env.step()
         observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]  # SNR, load, capacity, handovers, total allocated bw,  allocation
     elif SELECTED_MODEL == 'ODT':
-        mask = env.env._get_action_mask()
-        action = predict_fn(agent, obs, mask)
+        mask = env.env._get_action_mask()[:odt_action_dim]
+        action = predict_fn(agent, obs[:odt_state_dim], mask)
         obs, reward, done, truncated, info = env.step(action)
-        agent.step(obs, action, reward, obs, done or truncated)
+        agent.step(obs[:odt_state_dim], action, reward, obs[:odt_state_dim], done or truncated)
         observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
     else:  # PPO or DQN
         mask = env.env._get_action_mask()
