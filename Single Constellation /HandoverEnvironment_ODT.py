@@ -18,7 +18,8 @@ def main():
     constellation_name = inputParams['Constellation'][0]
     route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
 
-    env = LEOEnv(constellation_name, route)
+    scenario = None
+    env = LEOEnv(constellation_name, route, scenario=scenario)
     env = ActionMasker(env, mask_fn)
 
 

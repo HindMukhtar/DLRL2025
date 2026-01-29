@@ -25,8 +25,8 @@ import gc  # Add garbage collection
 # ==============================================
 # MODEL SELECTION - Choose which model to test
 # ==============================================
-# Options: 'ODT', 'DQN', 'PPO', 'BASELINE'
-SELECTED_MODEL = 'PPO'  # Default: ODT
+# Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED'
+SELECTED_MODEL = 'ODT_FINETUNED'  # Default: ODT
 
 def append_observation_to_file(obs, step, model_name, filename):
     """Append single observation to file"""
@@ -53,132 +53,135 @@ inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
 constellation_name = inputParams['Constellation'][0]
 route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
 
-# Initialize only the selected model and environment
-if SELECTED_MODEL == 'PPO':
-    print("Loading PPO Agent...")
-    env = LEOEnvPPO(constellation_name, route)
-    env = ActionMasker(env, mask_fn)
-    agent = MaskablePPO("MlpPolicy", env, verbose=0)
-    agent.load(os.path.join(base_dir, "handover_ppo_agent"))
-    env.env.earth.Training = False
-    predict_fn = predict_valid_action
-    
-elif SELECTED_MODEL == 'DQN':
-    print("Loading DQN Agent...")
-    env = LEOEnvDQN(constellation_name, route)
-    env = ActionMasker(env, mask_fn)
-    agent = DQN("MlpPolicy", env, verbose=0, buffer_size=50)
-    agent.load(os.path.join(base_dir, "handover_dqn_agent"))
-    env.env.earth.Training = False
-    predict_fn = predict_valid_action_dqn
-    
-elif SELECTED_MODEL == 'ODT':
-    print("Loading ODT Agent...")
-    env = LEOEnvODT(constellation_name, route)
-    env = ActionMasker(env, mask_fn)
-    model_path = os.path.join(base_dir, "decision_transformer_offline.pth")
-    checkpoint = torch.load(model_path, map_location="cpu")
-    state_dim = checkpoint["model_state_dict"]["state_embedding.weight"].shape[1]
-    action_dim = checkpoint["model_state_dict"]["action_embedding.weight"].shape[0]
-    odt_state_dim = state_dim
-    odt_action_dim = action_dim
-    agent = OnlineDecisionTransformer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        max_length=10,
-        embed_dim=32,
-        num_layers=1,
-        target_return=1.0,
-        buffer_size=150
-    )
-    agent.load(model_path)
-    env.env.earth.Training = False
-    predict_fn = predict_valid_action_dt
-    
-elif SELECTED_MODEL == 'BASELINE':
-    print("Loading Baseline Environment...")
-    env = LEOEnvBase(constellation_name, route)
-    env.earth.Training = False
-    agent = None  # Baseline doesn't use an agent
-    predict_fn = None
-    
-else:
-    raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'DQN', 'PPO', 'BASELINE'")
+SCENARIOS = [None, "demand_aware", "multi_objective", "peak_hour", "large_aircraft"]
+ODT_MODELS = [
+    ("ODT", "decision_transformer_offline.pth"),
+    ("ODT_FINETUNED", "decision_transformer_online_finetune.pth"),
+]
 
-print(f"Model {SELECTED_MODEL} loaded successfully!")
-print(f"Route duration: {route_duration}")
-print("=" * 50)
+for scenario in SCENARIOS:
+    scenario_suffix = "no_scenario" if scenario is None else scenario
+    if SELECTED_MODEL == 'PPO':
+        print("Loading PPO Agent...")
+        env = LEOEnvPPO(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        agent = MaskablePPO("MlpPolicy", env, verbose=0)
+        agent.load(os.path.join(base_dir, "handover_ppo_agent"))
+        env.env.earth.Training = False
+        predict_fn = predict_valid_action
+        
+    elif SELECTED_MODEL == 'DQN':
+        print("Loading DQN Agent...")
+        env = LEOEnvDQN(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        agent = DQN("MlpPolicy", env, verbose=0, buffer_size=50)
+        agent.load(os.path.join(base_dir, "handover_dqn_agent"))
+        env.env.earth.Training = False
+        predict_fn = predict_valid_action_dqn
+        
+    elif SELECTED_MODEL in ('ODT', 'ODT_FINETUNED'):
+        pass
+        
+    elif SELECTED_MODEL == 'BASELINE':
+        print("Loading Baseline Environment...")
+        env = LEOEnvBase(constellation_name, route, scenario=scenario)
+        env.earth.Training = False
+        agent = None  # Baseline doesn't use an agent
+        predict_fn = None
+        
+    else:
+        raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'ODT_FINETUNED', 'DQN', 'PPO', 'BASELINE'")
 
-# Initialize environment and tracking variables
-done = False
-step_count = 0
-results_filename = f'{SELECTED_MODEL}_observations.csv'
-if os.path.exists(results_filename):
-    os.remove(results_filename)
+    if SELECTED_MODEL != 'ODT':
+        print(f"Model {SELECTED_MODEL} loaded successfully!")
+        print(f"Route duration: {route_duration}")
+        print("=" * 50)
 
-# Reset environment
-if SELECTED_MODEL == 'BASELINE':
-    obs, info = env.reset()
-else:
-    obs, info = env.reset()
+    def run_evaluation(model_label, env, agent, predict_fn, odt_state_dim=None, odt_action_dim=None):
+        done = False
+        step_count = 0
+        results_filename = f"{model_label}_observations_{scenario_suffix}.csv"
+        if os.path.exists(results_filename):
+            os.remove(results_filename)
 
-print(f"Starting evaluation for {SELECTED_MODEL} model...")
-print(f"Full route duration: {route_duration} steps")
-print(f"Results will be saved to: {results_filename}")
+        obs, info = env.reset()
 
-while not done:
-    # Reduce print frequency to save memory
-    if step_count % 25 == 0:
-        print(f"Step {step_count} - Model: {SELECTED_MODEL}")
-    
-    # Take action based on selected model
-    if SELECTED_MODEL == 'BASELINE':
-        obs, reward, done, truncated, info = env.step()
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]  # SNR, load, capacity, handovers, total allocated bw,  allocation
-    elif SELECTED_MODEL == 'ODT':
-        mask = env.env._get_action_mask()[:odt_action_dim]
-        action = predict_fn(agent, obs[:odt_state_dim], mask)
-        obs, reward, done, truncated, info = env.step(action)
-        agent.step(obs[:odt_state_dim], action, reward, obs[:odt_state_dim], done or truncated)
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
-    else:  # PPO or DQN
-        mask = env.env._get_action_mask()
-        action = predict_fn(agent, obs, mask)
-        if SELECTED_MODEL == 'DQN':
-            obs, reward, done, truncated, info = env.step(action)
-        else:  # PPO
-            obs, reward, done, truncated, info = env.env.step(action)
-        observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
-    
-    # Append observation to file immediately
-    append_observation_to_file(observation_data, step_count, SELECTED_MODEL, results_filename)
-    
-    step_count += 1
+        print(f"Starting evaluation for {model_label} model (scenario: {scenario_suffix})...")
+        print(f"Full route duration: {route_duration} steps")
+        print(f"Results will be saved to: {results_filename}")
 
-print(f"\nCompleted {step_count} steps for {SELECTED_MODEL}")
+        while not done:
+            if step_count % 25 == 0:
+                print(f"Step {step_count} - Model: {model_label} - Scenario: {scenario_suffix}")
 
-# Save final results summary
-print("Saving final summary...")
+            if model_label == 'BASELINE':
+                obs, reward, done, truncated, info = env.step()
+            elif model_label.startswith('ODT'):
+                mask = env.env._get_action_mask()[:odt_action_dim]
+                action = predict_fn(agent, obs[:odt_state_dim], mask)
+                obs, reward, done, truncated, info = env.step(action)
+                agent.step(obs[:odt_state_dim], action, reward, obs[:odt_state_dim], done or truncated)
+            else:
+                mask = env.env._get_action_mask()
+                action = predict_fn(agent, obs, mask)
+                if model_label == 'DQN':
+                    obs, reward, done, truncated, info = env.step(action)
+                else:
+                    obs, reward, done, truncated, info = env.env.step(action)
 
-final_results = {
-    'model_tested': SELECTED_MODEL,
-    'steps_completed': step_count,
-    'route_duration': route_duration,
-    'completion_status': done,
-    'observations_file': results_filename
-}
+            observation_data = [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9], obs[10], obs[11], obs[12], obs[13], obs[14], obs[15], obs[16], obs[17]]
+            append_observation_to_file(observation_data, step_count, model_label, results_filename)
+            step_count += 1
 
-with open(f'{SELECTED_MODEL}_summary.pkl', 'wb') as f:
-    pickle.dump(final_results, f)
+        print(f"\nCompleted {step_count} steps for {model_label} (scenario: {scenario_suffix})")
 
-print("All results saved successfully!")
-print(f"Model tested: {SELECTED_MODEL}")
-print(f"Final step count: {step_count}")
-print(f"Route duration: {route_duration}")
-print(f"Completion status: {done}")
-print(f"Observations saved to: {results_filename}")
-print("Memory optimizations applied:")
-print("- Single model execution")
-print("- Real-time file appending (no memory accumulation)")
-print("- Periodic garbage collection")
-print("- No step limit - full route completed")
+        final_results = {
+            'model_tested': model_label,
+            'scenario': scenario_suffix,
+            'steps_completed': step_count,
+            'route_duration': route_duration,
+            'completion_status': done,
+            'observations_file': results_filename
+        }
+
+        with open(f"{model_label}_summary_{scenario_suffix}.pkl", 'wb') as f:
+            pickle.dump(final_results, f)
+
+        print("All results saved successfully!")
+        print(f"Model tested: {model_label}")
+        print(f"Final step count: {step_count}")
+        print(f"Route duration: {route_duration}")
+        print(f"Completion status: {done}")
+        print(f"Observations saved to: {results_filename}")
+        print("Memory optimizations applied:")
+        print("- Single model execution")
+        print("- Real-time file appending (no memory accumulation)")
+        print("- Periodic garbage collection")
+        print("- No step limit - full route completed")
+
+    if SELECTED_MODEL in ('ODT', 'ODT_FINETUNED'):
+        selected_models = ODT_MODELS
+        if SELECTED_MODEL == 'ODT_FINETUNED':
+            selected_models = [m for m in ODT_MODELS if m[0] == 'ODT_FINETUNED']
+        for model_label, model_file in selected_models:
+            print(f"Loading {model_label} Agent...")
+            env = LEOEnvODT(constellation_name, route, scenario=scenario)
+            env = ActionMasker(env, mask_fn)
+            model_path = os.path.join(base_dir, model_file)
+            checkpoint = torch.load(model_path, map_location="cpu")
+            state_dim = checkpoint["model_state_dict"]["state_embedding.weight"].shape[1]
+            action_dim = checkpoint["model_state_dict"]["action_embedding.weight"].shape[0]
+            agent = OnlineDecisionTransformer(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                max_length=10,
+                embed_dim=32,
+                num_layers=1,
+                target_return=1.0,
+                buffer_size=150
+            )
+            agent.load(model_path)
+            env.env.earth.Training = False
+            run_evaluation(model_label, env, agent, predict_valid_action_dt, state_dim, action_dim)
+    else:
+        run_evaluation(SELECTED_MODEL, env, agent, predict_fn)

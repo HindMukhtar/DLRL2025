@@ -141,6 +141,7 @@ class OrbitalPlane:
             sat.update_beam_loads(env_time)  # Update beam loads based on time
 
 class Beam:
+    scenario = None
     _pop_density = None
     _pop_shape = None
     start_utc_hour = 0.0
@@ -623,6 +624,7 @@ def load_route_from_csv(filename, skip_rows=0):
 
 
 class Aircraft: 
+    scenario = None
     def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1, passengers = None):
         self.passengers = passengers 
         self.time = 0 # in seconds 
@@ -654,7 +656,11 @@ class Aircraft:
         self.handover_count = 0
         self.min_dwell_s = 15.0
         self.time_to_trigger_s = 10.0
-        self.service_drop_s = 2.0
+        self.service_drop_s_beam = 2.0
+        self.service_drop_s_sat = 5.0
+        if Aircraft.scenario == "multi_objective":
+            self.service_drop_s_beam = 5.0
+            self.service_drop_s_sat = 8.0
         self.last_handover_time = -float("inf")
         self.ttt_candidate = None
         self.ttt_candidate_sat = None
@@ -890,10 +896,10 @@ class Aircraft:
         queing_delay, transmission_rate_mbps = self.queing_delay(deltaT)
         propagation_latency = self._calculate_latency()*2 # Round trip latency
         sim_time = self.env.now if hasattr(self.env, "now") else self.time
-        if self.service_drop_until > sim_time:
-            service_drop_s = min(deltaT, self.service_drop_until - sim_time)
-        else:
-            service_drop_s = 0.0
+        step_start = sim_time - deltaT
+        drop_start = self.last_handover_time
+        drop_end = self.service_drop_until
+        service_drop_s = max(0.0, min(sim_time, drop_end) - max(step_start, drop_start))
         dwell_remaining_s = max(0.0, self.min_dwell_s - (sim_time - self.last_handover_time))
         if self.ttt_start_time is None:
             ttt_remaining_s = 0.0
@@ -1009,12 +1015,14 @@ class Aircraft:
 
         self.handover_count += 1
         print(f"Time {sim_time:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
+        sat_changed = self.connected_satellite is not None and best_candidate_sat != self.connected_satellite
         self.connected_beam = best_candidate_beam
         self.connected_satellite = best_candidate_sat
         self.current_snr = best_snr
         self.current_latency = self._calculate_latency()
         self.last_handover_time = sim_time
-        self.service_drop_until = sim_time + self.service_drop_s
+        drop_duration = self.service_drop_s_sat if sat_changed else self.service_drop_s_beam
+        self.service_drop_until = sim_time + drop_duration
         self.ttt_candidate = None
         self.ttt_candidate_sat = None
         self.ttt_start_time = None
@@ -1047,9 +1055,11 @@ class Aircraft:
         return 0           
 
 class Passenger: 
-    def __init__(self, ID, application = None):
+    scenario = None
+    def __init__(self, ID, application = None, rng=None):
         self.ID = ID
         self.application = application 
+        self.rng = rng or random.Random()
         self.APP_PROBS = {
                         "streaming":      0.25,
                         "voip":           0.10,
@@ -1057,6 +1067,15 @@ class Passenger:
                         "web":            0.30,
                         "file_transfer":  0.10,
                         "video_conference": 0.15,
+                    }
+        if Passenger.scenario == "demand_aware":
+            self.APP_PROBS = {
+                        "streaming":      0.45,
+                        "voip":           0.03,
+                        "email":          0.02,
+                        "web":            0.10,
+                        "file_transfer":  0.15,
+                        "video_conference": 0.25,
                     }
         
         self.APP_CLASSES = {
@@ -1078,10 +1097,10 @@ class Passenger:
         # 2) If idle, maybe start a new app
         if self.application is None:
             start_prob = 0.5  # 50% chance per 10 seconds
-            if random.random() < start_prob:
+            if self.rng.random() < start_prob:
                 apps  = list(self.APP_PROBS.keys())
                 probs = list(self.APP_PROBS.values())
-                app_name = random.choices(apps, weights=probs, k=1)[0]
+                app_name = self.rng.choices(apps, weights=probs, k=1)[0]
                 self.application = self.APP_CLASSES[app_name]()  # Each app now uses seconds
 
         # 3) Demand
@@ -1446,7 +1465,7 @@ class Earth:
 ###############################################################################
 
 
-def initialize(env, constellationType, route):
+def initialize(env, constellationType, route, scenario=None, demand_seed=42):
     """
     Initializes an instance of the earth with cells from a population map and gateways from a csv file.
     During initialisation, several steps are performed to prepare for simulation:
@@ -1460,12 +1479,20 @@ def initialize(env, constellationType, route):
     """
 
     # Load earth, aircraft, passengers and consellations 
-    passenger1 = Passenger("P-001")
-    passenger2 = Passenger("P-002")
-    passenger3 = Passenger("P-003")
-    passenger4 = Passenger("P-004")
-    passenger5 = Passenger("P-005")
-    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10, passengers=[passenger1, passenger2, passenger3, passenger4, passenger5])
+    Beam.scenario = scenario
+    Beam.start_utc_hour = 0.0
+    if scenario == "peak_hour":
+        Beam.start_utc_hour = 17.75
+    Passenger.scenario = scenario
+    Aircraft.scenario = scenario
+    passenger_count = 5
+    if scenario == "large_aircraft":
+        passenger_count = 20
+    passengers = [
+        Passenger(f"P-{i:03d}", rng=random.Random(demand_seed + i))
+        for i in range(1, passenger_count + 1)
+    ]
+    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10, passengers=passengers)
     # aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=8000000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, constellationType, [aircraft1])
 

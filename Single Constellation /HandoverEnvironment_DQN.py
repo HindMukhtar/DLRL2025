@@ -26,7 +26,7 @@ class LEOEnv(gym.Env):
     Gymnasium environment wrapper for the LEO satellite handover simulation.
     """
 
-    def __init__(self, constellation_name, route):
+    def __init__(self, constellation_name, route, scenario=None):
         super(LEOEnv, self).__init__()
 
         # We'll set a placeholder action space, but update it dynamically
@@ -41,6 +41,7 @@ class LEOEnv(gym.Env):
         self.constellation = constellation_name 
         self.route = route 
         self.deltaT = 1
+        self.scenario = scenario
 
         self.env = None
         self.earth = None
@@ -59,7 +60,7 @@ class LEOEnv(gym.Env):
     def _setup_simulation(self):
 
         self.env = simpy.Environment()
-        self.earth = initialize(self.env, self.constellation, self.route)
+        self.earth = initialize(self.env, self.constellation, self.route, scenario=self.scenario)
         self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
         self.current_step = 0
 
@@ -132,18 +133,7 @@ class LEOEnv(gym.Env):
             
             if beam_id in available_ids:
                 chosen = next(b for b in self.available_beams if b['beam'].id == beam_id)
-                
-                if self.aircraft.connected_beam != chosen['beam']:
-                    print(f"Aircraft {self.aircraft.id} HANDOVER from {self.aircraft.connected_beam.id if self.aircraft.connected_beam else 'None'} to beam {chosen['beam'].id}")
-                    self.aircraft.connected_beam = chosen['beam']
-                    self.aircraft.connected_satellite = chosen['sat']
-                    self.aircraft.current_snr = chosen['snr']
-                    self.aircraft.handover_count += 1
-                else:
-                    print(f"Aircraft {self.aircraft.id} STAYING CONNECTED to beam {chosen['beam'].id}")
-                    # Update SNR in case it changed
-                    self.aircraft.current_snr = chosen['snr']
-                    self.handover_occurred = True
+                self._apply_action_with_handover_constraints(chosen)
             else:
                 print(f"Invalid action: beam {beam_id} not available")
                 self.aircraft.connected_beam = None 
@@ -262,6 +252,52 @@ class LEOEnv(gym.Env):
 
         return float(reward)
 
+    def _apply_action_with_handover_constraints(self, chosen):
+        sim_time = self.env.now
+        ac = self.aircraft
+
+        if ac.connected_beam is None:
+            print(f"Aircraft {ac.id} CONNECTED to beam {chosen['beam'].id} (Initial connection)")
+            ac.connected_beam = chosen['beam']
+            ac.connected_satellite = chosen['sat']
+            ac.current_snr = chosen['snr']
+            ac.last_handover_time = sim_time
+            return
+
+        if ac.connected_beam == chosen['beam']:
+            print(f"Aircraft {ac.id} STAYING CONNECTED to beam {chosen['beam'].id}")
+            ac.current_snr = chosen['snr']
+            return
+
+        if sim_time - ac.last_handover_time < ac.min_dwell_s:
+            current = next((c for c in self.available_beams if c and c['beam'] == ac.connected_beam), None)
+            if current:
+                ac.current_snr = current['snr']
+            return
+
+        if ac.ttt_candidate != chosen['beam']:
+            ac.ttt_candidate = chosen['beam']
+            ac.ttt_candidate_sat = chosen['sat']
+            ac.ttt_start_time = sim_time
+            return
+
+        if sim_time - ac.ttt_start_time < ac.time_to_trigger_s:
+            return
+
+        print(f"Aircraft {ac.id} HANDOVER from {ac.connected_beam.id} to beam {chosen['beam'].id}")
+        sat_changed = ac.connected_satellite is not None and chosen['sat'] != ac.connected_satellite
+        ac.connected_beam = chosen['beam']
+        ac.connected_satellite = chosen['sat']
+        ac.current_snr = chosen['snr']
+        ac.handover_count += 1
+        ac.last_handover_time = sim_time
+        drop_duration = ac.service_drop_s_sat if sat_changed else ac.service_drop_s_beam
+        ac.service_drop_until = sim_time + drop_duration
+        ac.ttt_candidate = None
+        ac.ttt_candidate_sat = None
+        ac.ttt_start_time = None
+        self.handover_occurred = True
+
     def render(self):
         if self.earth:
             self.earth.plotMap(plotSat=True, plotBeams=True, plotAircrafts=True, aircrafts=[self.aircraft])
@@ -298,7 +334,8 @@ def main():
     inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = inputParams['Constellation'][0]
     route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
-    env = LEOEnv(constellation_name, route)
+    scenario = None
+    env = LEOEnv(constellation_name, route, scenario=scenario)
     env = ActionMasker(env, mask_fn)
 
     # Create the DQN agent

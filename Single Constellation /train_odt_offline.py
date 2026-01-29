@@ -62,7 +62,7 @@ def main():
     for traj in trajectories:
         model.buffer.add_trajectory(traj)
 
-    epochs = 10000
+    epochs = 50000
     steps_per_epoch = 80
     batch_size = 32
 
