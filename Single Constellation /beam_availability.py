@@ -9,7 +9,7 @@ from LEOEnvironmentRL import initialize, load_route_from_csv
 def main():
     base_dir = os.path.dirname(__file__)
     route_path = os.path.join(base_dir, "route_5s_interpolated.csv")
-    scenarios = ["no_scenario", "demand_aware", "multi_objective", "peak_hour", "large_aircraft"]
+    scenarios = ["no_scenario", "demand_aware", "snr_congested", "peak_hour", "large_aircraft"]
     route, _ = load_route_from_csv(route_path, skip_rows=0)
     output_path = os.path.join(base_dir, "beam_availability_all_scenarios.txt")
 

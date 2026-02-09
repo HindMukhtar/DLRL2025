@@ -5,6 +5,7 @@ import simpy
 from LEOEnvironmentRL import initialize, load_route_from_csv  # Use RL version
 import pandas as pd
 import os
+import math
 from stable_baselines3 import DQN
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
@@ -48,9 +49,11 @@ class LEOEnv(gym.Env):
         self.aircraft = None
         self.current_step = 0
         self.handover_occurred = False
+        self.force_best_beam_on_first_step = True
 
         self.available_beams = []  # List of available beams for current step
         self.action_mask = None
+        self.last_qoe = None
 
         np.random.seed(42)
         random.seed(42)
@@ -96,6 +99,7 @@ class LEOEnv(gym.Env):
         random.seed(42)
         self._setup_simulation()
         self.action_mask = self._get_action_mask()  # Store mask
+        self._refresh_qoe_cache()
         obs = self._get_obs()
         info = {
             "available_beams": self.available_beams,
@@ -109,10 +113,13 @@ class LEOEnv(gym.Env):
         print(len(self.all_beam_ids))
         reward_penalty = 0
         self.handover_occurred = False
+        if self.force_best_beam_on_first_step and self.current_step == 0:
+            action = 0
 
         # Handle penalty action
         if action == -1:
             print("No valid actions available! Returning penalty and skipping step.")
+            self._refresh_qoe_cache()
             obs = self._get_obs()
             base_reward = self._get_reward()
             final_reward = base_reward - 1.0  # Penalty
@@ -160,6 +167,7 @@ class LEOEnv(gym.Env):
         # Update action mask for next step 
         self.action_mask = self._get_action_mask()
 
+        self._refresh_qoe_cache()
         obs = self._get_obs()
         base_reward = self._get_reward()
         final_reward = base_reward + reward_penalty  # Add penalty
@@ -178,8 +186,12 @@ class LEOEnv(gym.Env):
 
         return obs, final_reward, terminated, truncated, info
 
+    def _refresh_qoe_cache(self):
+        self.last_qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        return self.last_qoe
+
     def _get_obs(self):
-        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        qoe = self.last_qoe if self.last_qoe is not None else self._refresh_qoe_cache()
         ac = self.aircraft
         lat = ac.latitude
         lon = ac.longitude
@@ -203,52 +215,44 @@ class LEOEnv(gym.Env):
         return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s], dtype=np.float32)
 
     def _get_reward(self):
-        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        qoe = self.last_qoe if self.last_qoe is not None else self._refresh_qoe_cache()
         if not qoe or "throughput_req_mbps" not in qoe or "latency_req_s" not in qoe:
             return 0.0
 
         print(f"QoE metrics: {qoe}")
 
-        deltaT = self.aircraft.deltaT
-
-        # --- Throughput satisfaction ---
-        throughput_req = qoe["throughput_req_mbps"]          # sum of min app throughputs (Mbps)
-        allocated_MB   = qoe["allocated_bandwidth_MB"]       # MB over this timestep
-        allocated_mbps = (allocated_MB * 8.0) / deltaT       # Mb / s
-
-        if throughput_req > 0:
-            throughput_satisfaction = min(allocated_mbps / throughput_req, 1.0)
-        else:
-            throughput_satisfaction = 1.0
+        # --- Allocation satisfaction (allocated / demand) ---
+        throughput_satisfaction = qoe.get("allocation_ratio", 0.0)
 
         # --- Latency satisfaction ---
         total_latency_s = qoe["queuing_delay_s"] + qoe["propagation_latency_s"]
         latency_req_s   = qoe["latency_req_s"]
 
         if latency_req_s > 0:
-            if total_latency_s <= latency_req_s:
-                latency_satisfaction = 1.0
-            else:
-                # degrade linearly from 1 at threshold to 0 at 2×threshold
-                ratio = total_latency_s / latency_req_s
-                latency_satisfaction = max(0.0, 1.0 - (ratio - 1.0))
+            over = max(0.0, total_latency_s - latency_req_s)
+            latency_satisfaction = math.exp(-over / latency_req_s)
         else:
             latency_satisfaction = 1.0
 
         # --- Combine throughput + latency ---
         w_thr = 0.7   # throughput weight
         w_lat = 0.3   # latency weight
+        w_drop = 0.2 # service drop weight
+
+        service_drop_s = qoe.get("service_drop_s", 0.0)
 
         reward = (
             w_thr * throughput_satisfaction +
-            w_lat * latency_satisfaction
+            w_lat * latency_satisfaction - 
+            w_drop * service_drop_s
         )
 
-        # Optional: handover penalty if you track it
-        if self.handover_occurred:
-            reward -= 0.05
-        service_drop_s = qoe.get("service_drop_s", 0.0)
-        reward -= 0.02 * service_drop_s
+        # # Optional: handover penalty if you track it
+        # if self.handover_occurred:
+        #     reward -= 0.05
+
+        # if not self.handover_occurred and throughput_satisfaction >= 0.9 and latency_satisfaction >= 0.9:
+        #     reward += 0.05
 
         return float(reward)
 
@@ -291,8 +295,7 @@ class LEOEnv(gym.Env):
         ac.current_snr = chosen['snr']
         ac.handover_count += 1
         ac.last_handover_time = sim_time
-        drop_duration = ac.service_drop_s_sat if sat_changed else ac.service_drop_s_beam
-        ac.service_drop_until = sim_time + drop_duration
+        ac.service_drop_until = sim_time
         ac.ttt_candidate = None
         ac.ttt_candidate_sat = None
         ac.ttt_start_time = None
@@ -334,7 +337,16 @@ def main():
     inputParams = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = inputParams['Constellation'][0]
     route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
-    scenario = None
+    scenarios = [
+        None,
+        "load_cycle_1",
+        "load_cycle_2",
+        "load_cycle_5",
+        "medium_aircraft",
+        "large_aircraft",
+        "snr_congested",
+    ]
+    scenario = scenarios[0]
     env = LEOEnv(constellation_name, route, scenario=scenario)
     env = ActionMasker(env, mask_fn)
 
@@ -342,39 +354,56 @@ def main():
     #model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32)
     device = _get_default_device()
     print(f"DQN device: {device}")
-    model = DQN("MlpPolicy", env, verbose=1, buffer_size=100, learning_starts=10, batch_size=32, device=device)
+    model = DQN(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        buffer_size=5000,
+        learning_starts=500,
+        batch_size=64,
+        gamma=0.99,
+        target_update_interval=500,
+        exploration_fraction=0.2,
+        exploration_final_eps=0.05,
+        device=device,
+    )
     # Call once just to initialize everything 
     model.learn(total_timesteps=1)
     # Train the agent
     #model.learn(total_timesteps=10000)
     # Custom training using action masking 
-    total_timesteps=10000
-    obs, info = env.reset()
-    for step in range(total_timesteps):
-        # Get current mask
-        mask = env.env._get_action_mask()  # Unwrap if using ActionMasker
+    total_timesteps = 100000
+    timesteps_per_scenario = max(1, total_timesteps // len(scenarios))
+    for scenario in scenarios:
+        print(f"Training DQN on scenario: {scenario if scenario else 'no_scenario'}")
+        env = LEOEnv(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        obs, info = env.reset()
+        for step in range(timesteps_per_scenario):
+            # Get current mask
+            mask = env.env._get_action_mask()  # Unwrap if using ActionMasker
 
-        # Get Q-values from the model
-        obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1).to(model.device)
-        q_values = model.q_net(obs_tensor).detach().cpu().numpy().flatten()
+            # Get Q-values from the model
+            obs_tensor = torch.tensor(obs, dtype=torch.float32).reshape(1, -1).to(model.device)
+            q_values = model.q_net(obs_tensor).detach().cpu().numpy().flatten()
 
-        # Mask invalid actions
-        q_values[~mask] = -1e10
-        action = np.argmax(q_values)
+            # Mask invalid actions
+            q_values[~mask] = -1e10
+            action = np.argmax(q_values)
 
-        # Step in the environment
-        next_obs, reward, done, truncated, info = env.step(action)
+            # Step in the environment
+            next_obs, reward, done, truncated, info = env.step(action)
 
-        # Store transition in replay buffer
-        model.replay_buffer.add(obs, next_obs, action, reward, done, [info])
+            # Store transition in replay buffer
+            model.replay_buffer.add(obs, next_obs, action, reward, done, [info])
 
-        # Train the model
-        if step > model.learning_starts:
-            model.train(batch_size=model.batch_size, gradient_steps=1)
+            # Train the model
+            if step > model.learning_starts:
+                model.train(batch_size=model.batch_size, gradient_steps=1)
 
-        obs = next_obs
-        if done or truncated:
-            obs, info = env.reset()
+            obs = next_obs
+            if done or truncated:
+                obs, info = env.reset()
 
     # Save the trained model
     model.save("handover_dqn_agent")

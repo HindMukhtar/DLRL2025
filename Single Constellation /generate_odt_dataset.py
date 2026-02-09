@@ -7,6 +7,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import math
 from sb3_contrib import MaskablePPO
 from stable_baselines3 import DQN
 from sb3_contrib.common.wrappers import ActionMasker
@@ -29,10 +30,11 @@ def _resolve_model_path(base_dir, name):
 
 def _collect_trajectories(env, predict_fn, model, episodes, quiet=True):
     trajectories = []
-    sink = io.StringIO() if quiet else None
-    cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
-    with cm:
-        for _ in range(episodes):
+    for ep in range(episodes):
+        print(f"Episode {ep+1}/{episodes}")
+        sink = io.StringIO() if quiet else None
+        cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
+        with cm:
             obs, info = env.reset()
             done = False
             truncated = False
@@ -45,7 +47,10 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True):
                 mask = env.env._get_action_mask()
                 if not np.any(mask):
                     break
-                action = predict_fn(model, obs, mask)
+                if predict_fn is _oracle_action:
+                    action = predict_fn(env)
+                else:
+                    action = predict_fn(model, obs, mask)
                 next_obs, reward, done, truncated, info = env.step(action)
                 states.append(obs)
                 actions.append(action)
@@ -64,10 +69,11 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True):
 
 def _collect_baseline_trajectories(env, episodes, quiet=True):
     trajectories = []
-    sink = io.StringIO() if quiet else None
-    cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
-    with cm:
-        for _ in range(episodes):
+    for ep in range(episodes):
+        print(f"Episode {ep+1}/{episodes}")
+        sink = io.StringIO() if quiet else None
+        cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
+        with cm:
             obs, info = env.reset()
             done = False
             truncated = False
@@ -99,37 +105,206 @@ def _collect_baseline_trajectories(env, episodes, quiet=True):
     return trajectories
 
 
+def _oracle_action(env):
+    base_env = env.env
+    mask = base_env._get_action_mask()
+    candidates = base_env.current_beam_candidates
+    ac = base_env.aircraft
+    qoe = base_env.last_qoe if getattr(base_env, "last_qoe", None) is not None else base_env._refresh_qoe_cache()
+
+    demand_mb = qoe.get("demand_MB", getattr(ac, "demand", 0.0))
+    latency_req_s = qoe.get("latency_req_s", 0.1)
+    deltaT = getattr(ac, "deltaT", 1.0) or 1.0
+
+    # Match environment reward weights.
+    w_thr = 0.7
+    w_lat = 0.3
+    w_drop = 0.2
+
+    best_action = -1
+    best_reward = -float("inf")
+
+    for i, candidate in enumerate(candidates):
+        if not mask[i] or candidate is None:
+            continue
+
+        beam = candidate["beam"]
+        snr = candidate["snr"]
+
+        # Throughput model aligned with env: min(shannon, demand, max_ds_speed).
+        shannon_capacity_mbps = beam.effective_bw * math.log2(1 + 10 ** (snr / 10)) / 1e6
+        demand_mbps = (demand_mb * 8.0) / max(deltaT, 1e-9)
+        served_mbps = min(shannon_capacity_mbps, beam.max_ds_speed, demand_mbps)
+        allocated_mb = (served_mbps * deltaT) / 8.0
+
+        if demand_mb > 0:
+            throughput_satisfaction = allocated_mb / demand_mb
+        else:
+            throughput_satisfaction = 1.0
+
+        # Queue delay estimate aligned with env implementation.
+        if served_mbps <= 0.0:
+            queue_delay_s = 1000.0
+        else:
+            demand_Mb = demand_mb * 8.0
+            service_Mb = served_mbps * deltaT
+            if demand_Mb <= service_Mb:
+                queue_delay_s = 0.0
+            else:
+                queue_delay_s = (demand_Mb - service_Mb) / served_mbps
+
+        # Propagation + fixed processing (deterministic part; skip random jitter for action ranking).
+        sat = candidate["sat"]
+        aircraft_to_sat_m = ac._calculate_3d_distance(sat)
+        sat_to_gateway_m = ac._calculate_3d_distance_to_gateway(sat)
+        c = 299792458.0
+        propagation_latency_s = (aircraft_to_sat_m + sat_to_gateway_m) * 2.0 / c + ac.fixed_processing_latency_s
+
+        total_latency_s = queue_delay_s + propagation_latency_s
+        if latency_req_s > 0:
+            over = max(0.0, total_latency_s - latency_req_s)
+            latency_satisfaction = math.exp(-over / latency_req_s)
+        else:
+            latency_satisfaction = 1.0
+
+        service_drop_s = deltaT if (demand_mb > 0 and allocated_mb <= 0) else 0.0
+
+        reward = (
+            w_thr * throughput_satisfaction
+            + w_lat * latency_satisfaction
+            - w_drop * service_drop_s
+        )
+
+        if reward > best_reward:
+            best_reward = reward
+            best_action = i
+
+    return best_action
+
+
 def main():
     base_dir = os.path.dirname(__file__)
     input_params = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = input_params["Constellation"][0]
     route, _ = load_route_from_csv(os.path.join(base_dir, "route_5s_interpolated.csv"), skip_rows=0)
-    scenario = None
+    scenarios = [
+        None,
+        "load_cycle_1",
+        "load_cycle_2",
+        "load_cycle_5",
+        "medium_aircraft",
+        "large_aircraft",
+        "snr_congested",
+    ]
 
-    episodes = 50
+    # Base per-scenario trajectory budget by source.
+    base_episode_budget = {
+        "ppo": 14,
+        "oracle": 14,
+        "dqn": 6,
+        "baseline": 4,
+    }
+    # Per-source, per-scenario multipliers to shape the dataset:
+    # - Baseline only for load_cycle_2
+    # - PPO oversampled for no_scenario, load_cycle_1, load_cycle_5, large_aircraft
+    # - DQN oversampled for no_scenario, load_cycle_5, snr_congested
+    # - Oracle oversampled for load_cycle_5, medium_aircraft
+    source_scenario_multiplier = {
+        "ppo": {
+            None: 2.0,
+            "load_cycle_1": 2.0,
+            "load_cycle_5": 2.0,
+            "large_aircraft": 2.0,
+        },
+        "dqn": {
+            None: 2.0,
+            "load_cycle_5": 2.0,
+            "snr_congested": 2.0,
+        },
+        "oracle": {
+            "load_cycle_5": 2.0,
+            "medium_aircraft": 2.0,
+        },
+        "baseline": {
+            "load_cycle_2": 1.0,
+        },
+    }
     trajectories = []
 
     np.random.seed(42)
     random.seed(42)
     torch.manual_seed(42)
 
-    ppo_env = PPOEnv(constellation_name, route, scenario=scenario)
-    ppo_env = ActionMasker(ppo_env, mask_fn)
-    ppo_env.env.earth.Training = True
     ppo_model_path = _resolve_model_path(base_dir, "handover_ppo_agent")
     ppo_model = MaskablePPO.load(ppo_model_path, device="cpu")
-    trajectories.extend(_collect_trajectories(ppo_env, predict_valid_action, ppo_model, episodes, quiet=True))
-
-    dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
-    dqn_env = ActionMasker(dqn_env, mask_fn)
-    dqn_env.env.earth.Training = True
     dqn_model_path = _resolve_model_path(base_dir, "handover_dqn_agent")
     dqn_model = DQN.load(dqn_model_path, device="cpu")
-    trajectories.extend(_collect_trajectories(dqn_env, predict_valid_action_dqn, dqn_model, episodes, quiet=True))
 
-    baseline_env = BaselineEnv(constellation_name, route, scenario=scenario)
-    baseline_env.earth.Training = True
-    trajectories.extend(_collect_baseline_trajectories(baseline_env, episodes, quiet=True))
+    for scenario in scenarios:
+        print(f"Collecting trajectories for scenario: {scenario if scenario else 'no_scenario'}")
+        episode_budget = {}
+        for source, base_count in base_episode_budget.items():
+            default_mult = 0.0 if source == "baseline" else 1.0
+            mult = source_scenario_multiplier.get(source, {}).get(scenario, default_mult)
+            episode_budget[source] = max(0, int(round(base_count * mult)))
+        print(f"Episode budget: {episode_budget}")
+
+        if episode_budget["ppo"] > 0:
+            print("PPO Agent Trajectories...")
+            ppo_env = PPOEnv(constellation_name, route, scenario=scenario)
+            ppo_env = ActionMasker(ppo_env, mask_fn)
+            ppo_env.env.earth.Training = True
+            trajectories.extend(
+                _collect_trajectories(
+                    ppo_env,
+                    predict_valid_action,
+                    ppo_model,
+                    episode_budget["ppo"],
+                    quiet=True,
+                )
+            )
+
+        if episode_budget["dqn"] > 0:
+            print("DQN Agent Trajectories...")
+            dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
+            dqn_env = ActionMasker(dqn_env, mask_fn)
+            dqn_env.env.earth.Training = True
+            trajectories.extend(
+                _collect_trajectories(
+                    dqn_env,
+                    predict_valid_action_dqn,
+                    dqn_model,
+                    episode_budget["dqn"],
+                    quiet=True,
+                )
+            )
+
+        if episode_budget["oracle"] > 0:
+            print("Oracle Agent Trajectories...")
+            oracle_env = PPOEnv(constellation_name, route, scenario=scenario)
+            oracle_env = ActionMasker(oracle_env, mask_fn)
+            oracle_env.env.earth.Training = True
+            trajectories.extend(
+                _collect_trajectories(
+                    oracle_env,
+                    _oracle_action,
+                    None,
+                    episode_budget["oracle"],
+                    quiet=True,
+                )
+            )
+
+        if episode_budget["baseline"] > 0:
+            print("Baseline Trajectories...")
+            baseline_env = BaselineEnv(constellation_name, route, scenario=scenario)
+            baseline_env.earth.Training = True
+            trajectories.extend(
+                _collect_baseline_trajectories(
+                    baseline_env,
+                    episode_budget["baseline"],
+                    quiet=True,
+                )
+            )
 
     output_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
     with open(output_path, "wb") as f:

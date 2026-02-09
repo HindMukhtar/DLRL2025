@@ -22,6 +22,10 @@ from scipy.spatial import KDTree
 import random
 import csv
 
+# Teleport gateway location (Ashburn, VA)
+GATEWAY_LAT = 39.0438
+GATEWAY_LON = -77.4874
+
 
 ###############################################################################
 #################################    Simpy    #################################
@@ -145,6 +149,7 @@ class Beam:
     _pop_density = None
     _pop_shape = None
     start_utc_hour = 0.0
+    load_cycle_s = 5400.0
     def __init__(self, center_lat, center_lon, width_deg, height_deg, 
                  load=1, capacity=10, snr=0, id=None, constellation = 'OneWeb'): # Default capacity added
         self.center_lat = center_lat
@@ -170,11 +175,12 @@ class Beam:
         if constellation == 'OneWeb': 
             #self.max_capacity = 7.2 #Gbps 
             self.max_capacity = 0.48 #Gbps reduce for now as we only have a single agent 
-            self.capacity = self.max_capacity*self.load
             self.max_ds_speed = 150 #Mbps 
             self.max_us_speed = 30 #Mbps 
             self.max_latency = 70 #ms 
             self.bw = 250e6 #Hz 
+            self.effective_bw = self.bw
+            self.capacity = self.max_capacity
             self.frequency = 15 #GHz 
             self.Pt = 40 #dBm - transmit power 
             self.Gt = 30 #dBi - antenna gain 
@@ -285,7 +291,8 @@ class Beam:
 
     def get_load_at_time(self, time_seconds):
         """
-        Calculate the load at a given time using population density, local time, and noise.
+        Calculate the load at a given time using population density and a full-cycle
+        episode sinusoid (low -> high -> low), plus correlated noise.
         
         Args:
             time_seconds: Current simulation time in seconds
@@ -297,22 +304,37 @@ class Beam:
         if base_density is None:
             base_density = self.base_load
 
-        local_hour = (Beam.start_utc_hour + time_seconds / 3600.0 + self.center_lon / 15.0) % 24.0
-        diurnal = 0.5 + 0.5 * math.cos(2 * math.pi * (local_hour - self.peak_local_hour) / 24.0)
-        current_load = (0.2 + 0.8 * base_density) * (0.3 + 0.7 * diurnal) + self.noise_state
+        cycle_s = max(1.0, Beam.load_cycle_s)
+        # Deterministic per-beam phase offset (longitude + beam-id jitter) to avoid full synchronization.
+        lon_phase = (self.center_lon + 180.0) / 360.0
+        id_hash = sum(ord(c) for c in str(self.id)) if self.id is not None else 0
+        id_phase = (id_hash % 997) / 997.0
+        beam_phase = (lon_phase + 0.1 * id_phase) % 1.0
+        phase = 0.5 + 0.5 * math.sin(2 * math.pi * ((time_seconds / cycle_s) + beam_phase) - math.pi / 2.0)
+        load_min = 0.05 + 0.15 * base_density
+        # Allow slight overshoot above 1.0 so clipping produces full saturation windows.
+        load_max = 0.82 + 0.28 * base_density
+        current_load = load_min + (load_max - load_min) * phase + self.noise_state
         
         # Ensure load stays within reasonable bounds (0-100%)
         return min(max(current_load, 0.0), 1.0)
     
     def update_load(self, time_seconds):
         """
-        Update the beam's current load based on the sinusoidal function.
+        Update the beam's current load based on the spatio-temporal model.
         
         Args:
             time_seconds: Current simulation time in seconds
         """
+        if self._last_load_time is None:
+            self._last_load_time = time_seconds
+        else:
+            dt = max(0.0, time_seconds - self._last_load_time)
+            self._last_load_time = time_seconds
+            self._update_noise(dt)
         self.load = self.get_load_at_time(time_seconds)
-        self.capacity = self.max_capacity*(1 - self.load)
+        self.effective_bw = self.bw * (1 - self.load)
+        self.capacity = self.max_capacity
 
 class Satellite:
     def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, quota = 500, power = 10):
@@ -625,14 +647,14 @@ def load_route_from_csv(filename, skip_rows=0):
 
 class Aircraft: 
     scenario = None
-    def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1, passengers = None):
+    def __init__(self, env, aircraft_id, route=None, height=10000, update_interval=1, passengers=None, handover_rng=None):
         self.passengers = passengers 
         self.time = 0 # in seconds 
         self.deltaT = 1 
         self.env = env
         self.id = aircraft_id
         self.update_interval = update_interval
-        self.Gr = 25 #dBi
+        self.Gr = 40 #dBi
 
         self.route = route or []
         self.route_index = 0
@@ -654,18 +676,21 @@ class Aircraft:
         self.current_snr = 0
         self.current_latency = 0
         self.handover_count = 0
-        self.min_dwell_s = 15.0
-        self.time_to_trigger_s = 10.0
-        self.service_drop_s_beam = 2.0
-        self.service_drop_s_sat = 5.0
-        if Aircraft.scenario == "multi_objective":
-            self.service_drop_s_beam = 5.0
-            self.service_drop_s_sat = 8.0
+        self.min_dwell_s = 5.0
+        self.time_to_trigger_s = 5.0
+        self.handover_rng = handover_rng or random.Random()
         self.last_handover_time = -float("inf")
         self.ttt_candidate = None
         self.ttt_candidate_sat = None
         self.ttt_start_time = None
         self.service_drop_until = 0.0
+        # Latency model terms (RTT-level additions): fixed processing + stochastic jitter
+        self.fixed_processing_latency_s = 0.030
+        self.jitter_std_s = 0.005
+        self.snr_congested_top_k = 2
+        self.snr_congested_bias = 0.35
+        self._snr_congestion_last_time = None
+        self._snr_congestion_applied_ids = set()
 
         self.demand = 0 
         self.total_allocated_bandwidth = 0.0  # Total allocated bandwidth (MB)
@@ -688,7 +713,7 @@ class Aircraft:
         Gt_dBi = beam.Gt  # Transmit antenna gain in dBi
         Gr_dBi = self.Gr  # Aircraft receive antenna gain in dBi
         f_Hz = beam.frequency * 1e9  # Frequency in Hz (beam.frequency in GHz)
-        B_Hz = beam.bw  # Bandwidth in Hz
+        B_Hz = max(beam.effective_bw, 1.0)  # Bandwidth in Hz
 
         # Convert dBm to dBW
         Pt_dBW = Pt_dBm - 30
@@ -748,8 +773,30 @@ class Aircraft:
                     'beam_id': beam.id,
                     'sat_id': sat.ID
                 })
+        if Aircraft.scenario == "snr_congested" and candidates:
+            self._apply_snr_congestion(candidates)
         print(f"candidates found: {len(candidates)}")
         return candidates
+
+    def _apply_snr_congestion(self, candidates):
+        sim_time = self.env.now if hasattr(self.env, "now") else self.time
+        if self._snr_congestion_last_time != sim_time:
+            self._snr_congestion_last_time = sim_time
+            self._snr_congestion_applied_ids.clear()
+        ranked = sorted(candidates, key=lambda c: c["snr"], reverse=True)
+        top_k = min(self.snr_congested_top_k, len(ranked))
+        for cand in ranked[:top_k]:
+            beam = cand["beam"]
+            if beam.id in self._snr_congestion_applied_ids:
+                cand["load"] = beam.load
+                cand["capacity"] = beam.capacity
+                continue
+            beam.load = min(1.0, beam.load + self.snr_congested_bias)
+            beam.effective_bw = beam.bw * (1 - beam.load)
+            beam.capacity = beam.max_capacity
+            self._snr_congestion_applied_ids.add(beam.id)
+            cand["load"] = beam.load
+            cand["capacity"] = beam.capacity
 
     def scan_nearby(self, constellation, threshold_km=500):
         results = []
@@ -812,23 +859,21 @@ class Aircraft:
 
         return self.demand, total_throughput, min_latency
 
-    def queing_delay(self, deltaT):
+    def queing_delay(self, requested, deltaT):
         """
         Calculate queuing delay based on current load and data size.
         
         Args:
             data_size_mb: Size of the data to be transmitted in megabytes  """ 
-        if self._service_drop_active():
-            return 1000, 0   
-        
         if self.connected_beam is None: 
             return 1000, 0   # No connection means infinite delay
         
         if self.connected_beam.load >= 1.0:
             return 1000, 0   # Infinite delay if load is at or above capacity
         
-        shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
-        transmission_rate_mbps = min(shannon_capacity, self.connected_beam.capacity*1000) # Convert Gbps to Mbps
+        shannon_capacity = self.connected_beam.effective_bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
+        demand_mbps = (self.demand * 8) / max(deltaT, 1e-9)
+        transmission_rate_mbps = min(shannon_capacity, self.connected_beam.max_ds_speed, demand_mbps)
         
         if transmission_rate_mbps <= 0.0:
             return 1000, 0.0
@@ -849,33 +894,38 @@ class Aircraft:
         Returns the ratio of allocated throughput to total demand for the current time step.
         Throughput is limited by the available beam capacity.
         """
-        if self._service_drop_active():
-            return 0, 0.0, self.demand, 0.0
         # Update demand for this timestep
         #self.update_demand(deltaT)
         #demand = self.demand  # in MB (as per your get_demand_at_time)
 
         # Get available capacity from the current beam (in Gbps, convert to MB for deltaT)
         if self.connected_beam:
+            if self.connected_beam.load >= 1.0:
+                allocated = 0.0
+                beam_capacity_MB = self.connected_beam.max_capacity * 125 * deltaT  # MB for reporting
+                shannon_capacity = 0.0
+            else:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
-            beam_capacity_MB = self.connected_beam.capacity * 125 * deltaT  # MB for this timestep
-            shannon_capacity = self.connected_beam.bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
+                beam_capacity_MB = self.connected_beam.max_capacity * 125 * deltaT  # MB for this timestep (for reporting)
+                shannon_capacity = self.connected_beam.effective_bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
         else:
             beam_capacity_MB = 0
             shannon_capacity = 0 
 
-        # Allocated bandwidth is bounded by shannon's capacity and beam capacity
-        if self.connected_beam: 
-            allocated = min(self.demand, (shannon_capacity * deltaT)/8, beam_capacity_MB)
+        # Allocated bandwidth is bounded by shannon capacity, demand, and max DS speed.
+        if self.connected_beam and self.connected_beam.load < 1.0: 
+            demand_mbps = (self.demand * 8) / max(deltaT, 1e-9)
+            served_mbps = min(shannon_capacity, self.connected_beam.max_ds_speed, demand_mbps)
+            allocated = (served_mbps * deltaT) / 8
         else: 
             allocated = 0 
 
-        # Avoid division by zero
+        # No unmet demand when demand is zero, so treat ratio as fully satisfied.
         if self.demand > 0:
             ratio = allocated / self.demand
         else:
-            ratio = 0
+            ratio = 1.0
 
         # Track stats for the episode
         self.total_allocated_bandwidth += allocated
@@ -883,23 +933,18 @@ class Aircraft:
 
         return ratio, allocated, self.demand, beam_capacity_MB   
 
-    def _service_drop_active(self):
-        sim_time = self.env.now if hasattr(self.env, "now") else self.time
-        return sim_time < self.service_drop_until
-
     def get_qoe_metrics(self, deltaT):
         """
         Returns qoe metrics based on passenger usage
         """
         demand, total_throughput_required, max_latency_allowed = self.step_passengers(deltaT)
         ratio, allocated, demand, beam_capacity_MB = self.allocation_ratio(deltaT) 
-        queing_delay, transmission_rate_mbps = self.queing_delay(deltaT)
-        propagation_latency = self._calculate_latency()*2 # Round trip latency
+        queing_delay, transmission_rate_mbps = self.queing_delay(total_throughput_required, deltaT)
+        # RTT latency = propagation RTT + fixed processing + stochastic jitter
+        jitter_s = abs(self.handover_rng.gauss(0.0, self.jitter_std_s))
+        propagation_latency = self._calculate_latency() * 2 + self.fixed_processing_latency_s + jitter_s
         sim_time = self.env.now if hasattr(self.env, "now") else self.time
-        step_start = sim_time - deltaT
-        drop_start = self.last_handover_time
-        drop_end = self.service_drop_until
-        service_drop_s = max(0.0, min(sim_time, drop_end) - max(step_start, drop_start))
+        service_drop_s = deltaT if demand > 0 and allocated <= 0 else 0.0
         dwell_remaining_s = max(0.0, self.min_dwell_s - (sim_time - self.last_handover_time))
         if self.ttt_start_time is None:
             ttt_remaining_s = 0.0
@@ -1021,8 +1066,7 @@ class Aircraft:
         self.current_snr = best_snr
         self.current_latency = self._calculate_latency()
         self.last_handover_time = sim_time
-        drop_duration = self.service_drop_s_sat if sat_changed else self.service_drop_s_beam
-        self.service_drop_until = sim_time + drop_duration
+        self.service_drop_until = sim_time
         self.ttt_candidate = None
         self.ttt_candidate_sat = None
         self.ttt_start_time = None
@@ -1043,14 +1087,24 @@ class Aircraft:
         total_distance_m = math.sqrt((dist_2d_km * 1000)**2 + (altitude_diff_m)**2)
         return total_distance_m
 
+    def _calculate_3d_distance_to_gateway(self, satellite):
+        """Calculates the 3D slant range from satellite to gateway."""
+        dist_2d_km = geopy.distance.geodesic(
+            (GATEWAY_LAT, GATEWAY_LON),
+            (math.degrees(satellite.latitude), math.degrees(satellite.longitude))
+        ).km
+        altitude_diff_m = satellite.h
+        total_distance_m = math.sqrt((dist_2d_km * 1000)**2 + (altitude_diff_m)**2)
+        return total_distance_m
+
     def _calculate_latency(self):
         """
-        Calculates the propagation latency from the aircraft to the connected satellite.
+        Calculates the propagation latency from the aircraft to the gateway via satellite.
         """
         if self.connected_satellite:
-            total_distance_m = self._calculate_3d_distance(self.connected_satellite)
-            # Propagation delay
-            propagation_delay = total_distance_m / Vc # Vc is speed of light in m/s
+            aircraft_to_sat_m = self._calculate_3d_distance(self.connected_satellite)
+            sat_to_gateway_m = self._calculate_3d_distance_to_gateway(self.connected_satellite)
+            propagation_delay = (aircraft_to_sat_m + sat_to_gateway_m) / Vc
             return propagation_delay
         return 0           
 
@@ -1465,7 +1519,7 @@ class Earth:
 ###############################################################################
 
 
-def initialize(env, constellationType, route, scenario=None, demand_seed=42):
+def initialize(env, constellationType, route, scenario=None, demand_seed=42, handover_seed=123):
     """
     Initializes an instance of the earth with cells from a population map and gateways from a csv file.
     During initialisation, several steps are performed to prepare for simulation:
@@ -1481,18 +1535,33 @@ def initialize(env, constellationType, route, scenario=None, demand_seed=42):
     # Load earth, aircraft, passengers and consellations 
     Beam.scenario = scenario
     Beam.start_utc_hour = 0.0
+    load_cycles = 1.0
+    if scenario == "load_cycle_2":
+        load_cycles = 2.0
+    elif scenario == "load_cycle_5":
+        load_cycles = 5.0
+    elif scenario == "load_cycle_1":
+        load_cycles = 1.0
+    if route and len(route) > 1:
+        route_duration_s = (route[-1]["time"] - route[0]["time"]).total_seconds()
+        Beam.load_cycle_s = max(1.0, route_duration_s / load_cycles)
+    else:
+        Beam.load_cycle_s = 5400.0
     if scenario == "peak_hour":
         Beam.start_utc_hour = 17.75
     Passenger.scenario = scenario
     Aircraft.scenario = scenario
     passenger_count = 5
-    if scenario == "large_aircraft":
-        passenger_count = 20
+    if scenario == "medium_aircraft":
+        passenger_count = 15
+    elif scenario == "large_aircraft":
+        passenger_count = 25
     passengers = [
         Passenger(f"P-{i:03d}", rng=random.Random(demand_seed + i))
         for i in range(1, passenger_count + 1)
     ]
-    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10, passengers=passengers)
+    handover_rng = random.Random(handover_seed)
+    aircraft1 = Aircraft(env, "A-380", route=route, height=10000, update_interval=10, passengers=passengers, handover_rng=handover_rng)
     # aircraft1 = Aircraft(env, "A-380", start_lat=37.77, start_lon=-122.41, height=10000, speed_kmph=8000000, direction_deg=345, update_interval=10)  # Example aircraft at San Francisco
     earth = Earth(env, constellationType, [aircraft1])
 

@@ -12,6 +12,7 @@ from HandoverEnvironment import mask_fn
 from sb3_contrib.common.wrappers import ActionMasker
 import pandas as pd
 import os
+import math
 import simpy
 
 def _get_default_device() -> str:
@@ -368,7 +369,7 @@ class OnlineDecisionTransformer:
             self.model.train()
         
     def predict_action(self, state: np.ndarray, mask: np.ndarray) -> int:
-        """Predict action given current state and action mask"""
+        """Predict action given current state and action mask (deterministic at inference)."""
         self.model.eval()
         
         with torch.no_grad():
@@ -451,18 +452,16 @@ class OnlineDecisionTransformer:
                 masked_logits = current_logits.clone()
                 masked_logits[~torch.tensor(mask, dtype=torch.bool, device=self.device)] = -1e10
                 
-                # Check if any valid actions
                 if not mask.any():
                     return -1  # No valid actions
-                
-                # Sample action
-                action_probs = F.softmax(masked_logits, dim=0)
-                action = torch.multinomial(action_probs, 1).item()
+
+                # Deterministic action selection for stable evaluation/inference.
+                action = int(torch.argmax(masked_logits).item())
             else:
-                # Fallback: random valid action
+                # Deterministic fallback: first valid action.
                 valid_actions = np.where(mask)[0]
                 if len(valid_actions) > 0:
-                    action = np.random.choice(valid_actions)
+                    action = int(valid_actions[0])
                 else:
                     action = -1
             
@@ -556,6 +555,7 @@ class OnlineDecisionTransformer:
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'target_return': float(self.target_return),
         }, path)
     
     def load(self, path: str):
@@ -563,6 +563,8 @@ class OnlineDecisionTransformer:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'target_return' in checkpoint:
+            self.target_return = float(checkpoint['target_return'])
 
 
 class LEOEnv(gym.Env):
@@ -591,9 +593,11 @@ class LEOEnv(gym.Env):
         self.aircraft = None
         self.current_step = 0
         self.handover_occurred = False
+        self.force_best_beam_on_first_step = True
 
         self.available_beams = []  # List of available beams for current step
         self.action_mask = None
+        self.last_qoe = None
 
         np.random.seed(42)
         random.seed(42)
@@ -639,6 +643,7 @@ class LEOEnv(gym.Env):
         random.seed(42)
         self._setup_simulation()
         self.action_mask = self._get_action_mask()  # Store mask
+        self._refresh_qoe_cache()
         obs = self._get_obs()
         info = {
             "available_beams": self.available_beams,
@@ -652,10 +657,13 @@ class LEOEnv(gym.Env):
         print(len(self.all_beam_ids))
         reward_penalty = 0
         self.handover_occurred = False
+        if self.force_best_beam_on_first_step and self.current_step == 0:
+            action = 0
 
         # Handle penalty action
         if action == -1:
             print("No valid actions available! Returning penalty and skipping step.")
+            self._refresh_qoe_cache()
             obs = self._get_obs()
             base_reward = self._get_reward()
             final_reward = base_reward - 1.0  # Penalty
@@ -703,6 +711,7 @@ class LEOEnv(gym.Env):
         # Update action mask for next step 
         self.action_mask = self._get_action_mask()
 
+        self._refresh_qoe_cache()
         obs = self._get_obs()
         base_reward = self._get_reward()
         final_reward = base_reward + reward_penalty  # Add penalty
@@ -722,8 +731,12 @@ class LEOEnv(gym.Env):
 
         return obs, final_reward, terminated, truncated, info
 
+    def _refresh_qoe_cache(self):
+        self.last_qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        return self.last_qoe
+
     def _get_obs(self):
-        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        qoe = self.last_qoe if self.last_qoe is not None else self._refresh_qoe_cache()
         ac = self.aircraft
         lat = ac.latitude
         lon = ac.longitude
@@ -747,52 +760,43 @@ class LEOEnv(gym.Env):
         return np.array([lat, lon, alt, snr, load, handovers, allocated_bw, allocation_ratio, demand_MB, throughput_req, queing_delay_s, propagation_latency_s, transmission_rate_mbps, latency_req_s, beam_capacity, service_drop_s, dwell_remaining_s, ttt_remaining_s], dtype=np.float32)
 
     def _get_reward(self):
-        qoe = self.aircraft.get_qoe_metrics(self.aircraft.deltaT)
+        qoe = self.last_qoe if self.last_qoe is not None else self._refresh_qoe_cache()
         if not qoe or "throughput_req_mbps" not in qoe or "latency_req_s" not in qoe:
             return 0.0
 
         print(f"QoE metrics: {qoe}")
 
-        deltaT = self.aircraft.deltaT
-
-        # --- Throughput satisfaction ---
-        throughput_req = qoe["throughput_req_mbps"]          # sum of min app throughputs (Mbps)
-        allocated_MB   = qoe["allocated_bandwidth_MB"]       # MB over this timestep
-        allocated_mbps = (allocated_MB * 8.0) / deltaT       # Mb / s
-
-        if throughput_req > 0:
-            throughput_satisfaction = min(allocated_mbps / throughput_req, 1.0)
-        else:
-            throughput_satisfaction = 1.0
+        # --- Allocation satisfaction (allocated / demand) ---
+        throughput_satisfaction = qoe.get("allocation_ratio", 0.0)
 
         # --- Latency satisfaction ---
         total_latency_s = qoe["queuing_delay_s"] + qoe["propagation_latency_s"]
         latency_req_s   = qoe["latency_req_s"]
 
         if latency_req_s > 0:
-            if total_latency_s <= latency_req_s:
-                latency_satisfaction = 1.0
-            else:
-                # degrade linearly from 1 at threshold to 0 at 2×threshold
-                ratio = total_latency_s / latency_req_s
-                latency_satisfaction = max(0.0, 1.0 - (ratio - 1.0))
+            over = max(0.0, total_latency_s - latency_req_s)
+            latency_satisfaction = math.exp(-over / latency_req_s)
         else:
             latency_satisfaction = 1.0
 
         # --- Combine throughput + latency ---
         w_thr = 0.7   # throughput weight
         w_lat = 0.3   # latency weight
+        w_drop = 0.2 # service drop weight
+
+        service_drop_s = qoe.get("service_drop_s", 0.0)
 
         reward = (
             w_thr * throughput_satisfaction +
-            w_lat * latency_satisfaction
+            w_lat * latency_satisfaction - 
+            w_drop * service_drop_s
         )
 
-        # Optional: handover penalty if you track it
-        if self.handover_occurred == True:
-            reward -= 0.1
-        service_drop_s = qoe.get("service_drop_s", 0.0)
-        reward -= 0.02 * service_drop_s
+        # # Optional: handover penalty if you track it
+        # if self.handover_occurred:
+        #     reward -= 0.05
+        # if not self.handover_occurred and throughput_satisfaction >= 0.9 and latency_satisfaction >= 0.9:
+        #     reward += 0.05
 
         return float(reward)
 
@@ -835,8 +839,7 @@ class LEOEnv(gym.Env):
         ac.current_snr = chosen['snr']
         ac.handover_count += 1
         ac.last_handover_time = sim_time
-        drop_duration = ac.service_drop_s_sat if sat_changed else ac.service_drop_s_beam
-        ac.service_drop_until = sim_time + drop_duration
+        ac.service_drop_until = sim_time
         ac.ttt_candidate = None
         ac.ttt_candidate_sat = None
         ac.ttt_start_time = None
