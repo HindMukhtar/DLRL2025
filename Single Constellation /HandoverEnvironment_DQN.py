@@ -338,7 +338,6 @@ def main():
     constellation_name = inputParams['Constellation'][0]
     route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
     scenarios = [
-        None,
         "load_cycle_1",
         "load_cycle_2",
         "load_cycle_5",
@@ -375,7 +374,7 @@ def main():
     total_timesteps = 100000
     timesteps_per_scenario = max(1, total_timesteps // len(scenarios))
     for scenario in scenarios:
-        print(f"Training DQN on scenario: {scenario if scenario else 'no_scenario'}")
+        print(f"Training DQN on scenario: {scenario}")
         env = LEOEnv(constellation_name, route, scenario=scenario)
         env = ActionMasker(env, mask_fn)
         obs, info = env.reset()

@@ -29,8 +29,8 @@ import math
 # ==============================================
 # MODEL SELECTION - Choose which model to test
 # ==============================================
-# Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE'
-SELECTED_MODEL = 'ORACLE'  # Default: ODT
+# Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE', 'BASELINE_LEGACY'
+SELECTED_MODEL = 'ODT'  # Default: ODT
 EVAL_SEED = 42
 
 def append_observation_to_file(obs, step, model_name, filename):
@@ -64,7 +64,6 @@ constellation_name = inputParams['Constellation'][0]
 route, route_duration = load_route_from_csv(os.path.join(base_dir, 'route_5s_interpolated.csv'), skip_rows=0)
 
 SCENARIOS = [
-    None,
     "load_cycle_1",
     "load_cycle_2",
     "load_cycle_5",
@@ -73,8 +72,8 @@ SCENARIOS = [
     "snr_congested",
 ]
 ODT_MODELS = [
-    ("ODT", "decision_transformer_offline.pth"),
-    ("ODT_FINETUNED", "decision_transformer_online_finetune.pth"),
+    ("ODT", "decision_transformer_offline_best.pth")
+    #("ODT_FINETUNED", "decision_transformer_online_finetune.pth"),
 ]
 
 
@@ -175,8 +174,31 @@ def predict_valid_action_oracle(base_env, obs, mask):
 
     return best_action
 
+
+def predict_valid_action_baseline_rl(agent, obs, mask, base_env=None):
+    """
+    Baseline policy on RL wrapper: choose highest-SNR valid candidate.
+    """
+    if not np.any(mask):
+        return -1
+    if base_env is None:
+        # Fallback: first valid
+        return int(np.where(mask)[0][0])
+
+    candidates = base_env.current_beam_candidates
+    best_idx = -1
+    best_snr = -float("inf")
+    for i, cand in enumerate(candidates):
+        if i >= len(mask) or not mask[i] or cand is None:
+            continue
+        snr = float(cand.get("snr", -1e9))
+        if snr > best_snr:
+            best_snr = snr
+            best_idx = i
+    return best_idx if best_idx >= 0 else int(np.where(mask)[0][0])
+
 for scenario in SCENARIOS:
-    scenario_suffix = "no_scenario" if scenario is None else scenario
+    scenario_suffix = scenario
     if SELECTED_MODEL == 'PPO':
         print("Loading PPO Agent...")
         env = LEOEnvPPO(constellation_name, route, scenario=scenario)
@@ -207,15 +229,23 @@ for scenario in SCENARIOS:
         pass
         
     elif SELECTED_MODEL == 'BASELINE':
-        print("Loading Baseline Environment...")
+        print("Loading Baseline policy on RL wrapper...")
+        env = LEOEnvPPO(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        env.env.earth.Training = False
+        agent = None
+        predict_fn = predict_valid_action_baseline_rl
+
+    elif SELECTED_MODEL == 'BASELINE_LEGACY':
+        print("Loading Baseline Legacy Environment...")
         LEOEnvModule.VERBOSE = False
         env = LEOEnvBase(constellation_name, route, scenario=scenario)
         env.earth.Training = False
-        agent = None  # Baseline doesn't use an agent
+        agent = None
         predict_fn = None
         
     else:
-        raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'ODT_FINETUNED', 'DQN', 'PPO', 'BASELINE', 'ORACLE'")
+        raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'ODT_FINETUNED', 'DQN', 'PPO', 'BASELINE', 'ORACLE', 'BASELINE_LEGACY'")
 
     if SELECTED_MODEL != 'ODT':
         print(f"Model {SELECTED_MODEL} loaded successfully!")
@@ -239,7 +269,7 @@ for scenario in SCENARIOS:
             if step_count % 25 == 0:
                 print(f"Step {step_count} - Model: {model_label} - Scenario: {scenario_suffix}")
 
-            if model_label == 'BASELINE':
+            if model_label == 'BASELINE_LEGACY':
                 obs, reward, done, truncated, info = env.step()
             elif model_label == 'ORACLE':
                 mask = env.env._get_action_mask()
@@ -255,7 +285,10 @@ for scenario in SCENARIOS:
                 obs = next_obs
             else:
                 mask = env.env._get_action_mask()
-                action = predict_fn(agent, obs, mask)
+                if model_label == 'BASELINE':
+                    action = predict_fn(agent, obs, mask, env.env)
+                else:
+                    action = predict_fn(agent, obs, mask)
                 if model_label == 'DQN':
                     obs, reward, done, truncated, info = env.step(action)
                 else:

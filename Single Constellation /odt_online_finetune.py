@@ -231,7 +231,6 @@ def main():
 
     # Weighted scenario schedule (focus weak scenarios).
     scenario_weights = {
-        None: 3,
         "load_cycle_1": 3,
         "load_cycle_2": 1,
         "load_cycle_5": 1,
@@ -239,8 +238,8 @@ def main():
         "large_aircraft": 1,
         "snr_congested": 1,
     }
-    sweep_scenarios = [None, "load_cycle_1"]
-    eval_scenarios = [None, "load_cycle_1", "large_aircraft", "snr_congested"]
+    sweep_scenarios = ["load_cycle_1"]
+    eval_scenarios = ["load_cycle_1", "large_aircraft", "snr_congested"]
 
     finetune_rounds = 3
     train_interval = 5
@@ -291,7 +290,7 @@ def main():
     losses = []
 
     for ep_idx, scenario in enumerate(schedule, start=1):
-        print(f"Fine-tuning episode {ep_idx}/{len(schedule)} on scenario: {scenario if scenario else 'no_scenario'}")
+        print(f"Fine-tuning episode {ep_idx}/{len(schedule)} on scenario: {scenario}")
         env = LEOEnv(constellation_name, route, scenario=scenario)
         env = ActionMasker(env, mask_fn)
         obs, info = env.reset()

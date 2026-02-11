@@ -29,7 +29,7 @@ def _split_easy_hard(trajectories):
     Fallback: if metadata is unavailable, return empty split to trigger uniform sampling.
     """
     # Regime definition can be tuned.
-    easy = {"no_scenario", "load_cycle_1", "load_cycle_2"}
+    easy = {"load_cycle_1", "load_cycle_2"}
     hard = {"load_cycle_5", "large_aircraft", "snr_congested", "medium_aircraft"}
 
     has_scenario_meta = any("scenario" in t for t in trajectories)
@@ -60,7 +60,10 @@ def main():
     base_dir = os.path.dirname(__file__)
     dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
     output_path = os.path.join(base_dir, "decision_transformer_offline.pth")
+    best_path = os.path.join(base_dir, "decision_transformer_offline_best.pth")
+    resume_path = best_path if os.path.exists(best_path) else None
 
+    #resume_path = None 
     with open(dataset_path, "rb") as f:
         trajectories = pickle.load(f)
 
@@ -113,6 +116,11 @@ def main():
         device=device,
     )
     model.optimizer.param_groups[0]["weight_decay"] = 1e-2
+
+    # Resume training from last best checkpoint if available.
+    if resume_path is not None:
+        print(f"Resuming offline ODT from: {resume_path}")
+        model.load(resume_path)
 
     for traj in trajectories:
         model.buffer.add_trajectory(traj)

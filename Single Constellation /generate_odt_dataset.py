@@ -28,7 +28,7 @@ def _resolve_model_path(base_dir, name):
         return zip_path
     return os.path.join(base_dir, name)
 
-def _collect_trajectories(env, predict_fn, model, episodes, quiet=True):
+def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario=None, source=None):
     trajectories = []
     for ep in range(episodes):
         print(f"Episode {ep+1}/{episodes}")
@@ -63,11 +63,13 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True):
                         "states": np.array(states, dtype=np.float32),
                         "actions": np.array(actions, dtype=np.int64),
                         "rewards": np.array(rewards, dtype=np.float32),
+                        "scenario": scenario,
+                        "source": source,
                     }
                 )
     return trajectories
 
-def _collect_baseline_trajectories(env, episodes, quiet=True):
+def _collect_baseline_trajectories(env, episodes, quiet=True, scenario=None, source=None):
     trajectories = []
     for ep in range(episodes):
         print(f"Episode {ep+1}/{episodes}")
@@ -100,6 +102,8 @@ def _collect_baseline_trajectories(env, episodes, quiet=True):
                         "states": np.array(states, dtype=np.float32),
                         "actions": np.array(actions, dtype=np.int64),
                         "rewards": np.array(rewards, dtype=np.float32),
+                        "scenario": scenario,
+                        "source": source,
                     }
                 )
     return trajectories
@@ -188,7 +192,6 @@ def main():
     constellation_name = input_params["Constellation"][0]
     route, _ = load_route_from_csv(os.path.join(base_dir, "route_5s_interpolated.csv"), skip_rows=0)
     scenarios = [
-        None,
         "load_cycle_1",
         "load_cycle_2",
         "load_cycle_5",
@@ -206,18 +209,16 @@ def main():
     }
     # Per-source, per-scenario multipliers to shape the dataset:
     # - Baseline only for load_cycle_2
-    # - PPO oversampled for no_scenario, load_cycle_1, load_cycle_5, large_aircraft
-    # - DQN oversampled for no_scenario, load_cycle_5, snr_congested
+    # - PPO oversampled for load_cycle_1, load_cycle_5, large_aircraft
+    # - DQN oversampled for load_cycle_5, snr_congested
     # - Oracle oversampled for load_cycle_5, medium_aircraft
     source_scenario_multiplier = {
         "ppo": {
-            None: 2.0,
             "load_cycle_1": 2.0,
             "load_cycle_5": 2.0,
             "large_aircraft": 2.0,
         },
         "dqn": {
-            None: 2.0,
             "load_cycle_5": 2.0,
             "snr_congested": 2.0,
         },
@@ -241,7 +242,7 @@ def main():
     dqn_model = DQN.load(dqn_model_path, device="cpu")
 
     for scenario in scenarios:
-        print(f"Collecting trajectories for scenario: {scenario if scenario else 'no_scenario'}")
+        print(f"Collecting trajectories for scenario: {scenario}")
         episode_budget = {}
         for source, base_count in base_episode_budget.items():
             default_mult = 0.0 if source == "baseline" else 1.0
@@ -261,6 +262,8 @@ def main():
                     ppo_model,
                     episode_budget["ppo"],
                     quiet=True,
+                    scenario=scenario,
+                    source="ppo",
                 )
             )
 
@@ -276,6 +279,8 @@ def main():
                     dqn_model,
                     episode_budget["dqn"],
                     quiet=True,
+                    scenario=scenario,
+                    source="dqn",
                 )
             )
 
@@ -291,6 +296,8 @@ def main():
                     None,
                     episode_budget["oracle"],
                     quiet=True,
+                    scenario=scenario,
+                    source="oracle",
                 )
             )
 
@@ -303,6 +310,8 @@ def main():
                     baseline_env,
                     episode_budget["baseline"],
                     quiet=True,
+                    scenario=scenario,
+                    source="baseline",
                 )
             )
 

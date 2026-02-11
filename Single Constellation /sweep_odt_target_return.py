@@ -14,7 +14,6 @@ from LEOEnvironmentRL import load_route_from_csv
 
 
 SCENARIOS = [
-    None,
     "load_cycle_1",
     "load_cycle_2",
     "load_cycle_5",
