@@ -14,7 +14,6 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 from HandoverEnvironment import LEOEnv as PPOEnv, predict_valid_action
 from HandoverEnvironment_DQN import LEOEnv as DQNEnv, predict_valid_action as predict_valid_action_dqn
-from LEOEnvironment import LEOEnv as BaselineEnv
 from LEOEnvironmentRL import load_route_from_csv
 
 
@@ -47,7 +46,7 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario
                 mask = env.env._get_action_mask()
                 if not np.any(mask):
                     break
-                if predict_fn is _oracle_action:
+                if model is None:
                     action = predict_fn(env)
                 else:
                     action = predict_fn(model, obs, mask)
@@ -69,56 +68,70 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario
                 )
     return trajectories
 
-def _collect_baseline_trajectories(env, episodes, quiet=True, scenario=None, source=None):
-    trajectories = []
-    for ep in range(episodes):
-        print(f"Episode {ep+1}/{episodes}")
-        sink = io.StringIO() if quiet else None
-        cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
-        with cm:
-            obs, info = env.reset()
-            done = False
-            truncated = False
-
-            states = []
-            actions = []
-            rewards = []
-
-            while not (done or truncated):
-                next_obs, reward, done, truncated, info = env.step()
-                beam = env.aircraft.connected_beam
-                if beam and beam.id in env.all_beam_ids:
-                    action = env.all_beam_ids.index(beam.id)
-                else:
-                    action = 0
-                states.append(obs)
-                actions.append(action)
-                rewards.append(reward)
-                obs = next_obs
-
-            if states:
-                trajectories.append(
-                    {
-                        "states": np.array(states, dtype=np.float32),
-                        "actions": np.array(actions, dtype=np.int64),
-                        "rewards": np.array(rewards, dtype=np.float32),
-                        "scenario": scenario,
-                        "source": source,
-                    }
-                )
-    return trajectories
-
-
-def _oracle_action(env):
-    base_env = env.env
-    mask = base_env._get_action_mask()
-    candidates = base_env.current_beam_candidates
+def _candidate_metrics(base_env, candidate):
     ac = base_env.aircraft
     qoe = base_env.last_qoe if getattr(base_env, "last_qoe", None) is not None else base_env._refresh_qoe_cache()
 
     demand_mb = qoe.get("demand_MB", getattr(ac, "demand", 0.0))
     latency_req_s = qoe.get("latency_req_s", 0.1)
     deltaT = getattr(ac, "deltaT", 1.0) or 1.0
+
+    beam = candidate["beam"]
+    snr = candidate["snr"]
+
+    # Throughput model aligned with env: min(shannon, demand, max_ds_speed).
+    shannon_capacity_mbps = beam.effective_bw * math.log2(1 + 10 ** (snr / 10)) / 1e6
+    demand_mbps = (demand_mb * 8.0) / max(deltaT, 1e-9)
+    served_mbps = min(shannon_capacity_mbps, beam.max_ds_speed, demand_mbps)
+    allocated_mb = (served_mbps * deltaT) / 8.0
+
+    if demand_mb > 0:
+        throughput_satisfaction = allocated_mb / demand_mb
+    else:
+        throughput_satisfaction = 1.0
+
+    # Queue delay estimate aligned with env implementation.
+    if served_mbps <= 0.0:
+        queue_delay_s = 1000.0
+    else:
+        demand_Mb = demand_mb * 8.0
+        service_Mb = served_mbps * deltaT
+        if demand_Mb <= service_Mb:
+            queue_delay_s = 0.0
+        else:
+            queue_delay_s = (demand_Mb - service_Mb) / served_mbps
+
+    # Propagation + fixed processing (deterministic part; skip random jitter for action ranking).
+    sat = candidate["sat"]
+    aircraft_to_sat_m = ac._calculate_3d_distance(sat)
+    sat_to_gateway_m = ac._calculate_3d_distance_to_gateway(sat)
+    c = 299792458.0
+    propagation_latency_s = (aircraft_to_sat_m + sat_to_gateway_m) * 2.0 / c + ac.fixed_processing_latency_s
+
+    total_latency_s = queue_delay_s + propagation_latency_s
+    if latency_req_s > 0:
+        over = max(0.0, total_latency_s - latency_req_s)
+        latency_satisfaction = math.exp(-over / latency_req_s)
+    else:
+        latency_satisfaction = 1.0
+
+    service_drop_s = deltaT if (demand_mb > 0 and allocated_mb <= 0) else 0.0
+    drop_risk = 1.0 if service_drop_s > 0 else 0.0
+    return {
+        "throughput_satisfaction": throughput_satisfaction,
+        "latency_satisfaction": latency_satisfaction,
+        "total_latency_s": total_latency_s,
+        "service_drop_s": service_drop_s,
+        "drop_risk": drop_risk,
+        "allocated_mb": allocated_mb,
+        "demand_mb": demand_mb,
+    }
+
+
+def _oracle_action(env):
+    base_env = env.env
+    mask = base_env._get_action_mask()
+    candidates = base_env.current_beam_candidates
 
     # Match environment reward weights.
     w_thr = 0.7
@@ -131,58 +144,65 @@ def _oracle_action(env):
     for i, candidate in enumerate(candidates):
         if not mask[i] or candidate is None:
             continue
-
-        beam = candidate["beam"]
-        snr = candidate["snr"]
-
-        # Throughput model aligned with env: min(shannon, demand, max_ds_speed).
-        shannon_capacity_mbps = beam.effective_bw * math.log2(1 + 10 ** (snr / 10)) / 1e6
-        demand_mbps = (demand_mb * 8.0) / max(deltaT, 1e-9)
-        served_mbps = min(shannon_capacity_mbps, beam.max_ds_speed, demand_mbps)
-        allocated_mb = (served_mbps * deltaT) / 8.0
-
-        if demand_mb > 0:
-            throughput_satisfaction = allocated_mb / demand_mb
-        else:
-            throughput_satisfaction = 1.0
-
-        # Queue delay estimate aligned with env implementation.
-        if served_mbps <= 0.0:
-            queue_delay_s = 1000.0
-        else:
-            demand_Mb = demand_mb * 8.0
-            service_Mb = served_mbps * deltaT
-            if demand_Mb <= service_Mb:
-                queue_delay_s = 0.0
-            else:
-                queue_delay_s = (demand_Mb - service_Mb) / served_mbps
-
-        # Propagation + fixed processing (deterministic part; skip random jitter for action ranking).
-        sat = candidate["sat"]
-        aircraft_to_sat_m = ac._calculate_3d_distance(sat)
-        sat_to_gateway_m = ac._calculate_3d_distance_to_gateway(sat)
-        c = 299792458.0
-        propagation_latency_s = (aircraft_to_sat_m + sat_to_gateway_m) * 2.0 / c + ac.fixed_processing_latency_s
-
-        total_latency_s = queue_delay_s + propagation_latency_s
-        if latency_req_s > 0:
-            over = max(0.0, total_latency_s - latency_req_s)
-            latency_satisfaction = math.exp(-over / latency_req_s)
-        else:
-            latency_satisfaction = 1.0
-
-        service_drop_s = deltaT if (demand_mb > 0 and allocated_mb <= 0) else 0.0
+        metrics = _candidate_metrics(base_env, candidate)
 
         reward = (
-            w_thr * throughput_satisfaction
-            + w_lat * latency_satisfaction
-            - w_drop * service_drop_s
+            w_thr * metrics["throughput_satisfaction"]
+            + w_lat * metrics["latency_satisfaction"]
+            - w_drop * metrics["service_drop_s"]
         )
 
         if reward > best_reward:
             best_reward = reward
             best_action = i
 
+    return best_action
+
+
+def _oracle_latency_action(env):
+    base_env = env.env
+    mask = base_env._get_action_mask()
+    candidates = base_env.current_beam_candidates
+
+    best_action = -1
+    best_latency = float("inf")
+    best_drop = float("inf")
+    for i, candidate in enumerate(candidates):
+        if not mask[i] or candidate is None:
+            continue
+        metrics = _candidate_metrics(base_env, candidate)
+        latency = metrics["total_latency_s"]
+        drop = metrics["service_drop_s"]
+        if (latency < best_latency) or (latency == best_latency and drop < best_drop):
+            best_latency = latency
+            best_drop = drop
+            best_action = i
+    return best_action
+
+
+def _oracle_drop_action(env):
+    base_env = env.env
+    mask = base_env._get_action_mask()
+    candidates = base_env.current_beam_candidates
+
+    best_action = -1
+    best_key = None
+    for i, candidate in enumerate(candidates):
+        if not mask[i] or candidate is None:
+            continue
+        metrics = _candidate_metrics(base_env, candidate)
+        # Priority:
+        # 1) avoid drop risk
+        # 2) maximize throughput satisfaction
+        # 3) lower latency
+        key = (
+            metrics["drop_risk"],
+            -metrics["throughput_satisfaction"],
+            metrics["total_latency_s"],
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_action = i
     return best_action
 
 
@@ -196,38 +216,58 @@ def main():
         "load_cycle_2",
         "load_cycle_5",
         "medium_aircraft",
-        "large_aircraft",
         "snr_congested",
     ]
 
     # Base per-scenario trajectory budget by source.
     base_episode_budget = {
-        "ppo": 14,
-        "oracle": 14,
-        "dqn": 6,
-        "baseline": 4,
+        "ppo": 12,
+        "oracle": 12,
+        "oracle_latency": 6,
+        "oracle_drop": 6,
+        "dqn": 12,
     }
     # Per-source, per-scenario multipliers to shape the dataset:
-    # - Baseline only for load_cycle_2
-    # - PPO oversampled for load_cycle_1, load_cycle_5, large_aircraft
-    # - DQN oversampled for load_cycle_5, snr_congested
-    # - Oracle oversampled for load_cycle_5, medium_aircraft
+    # - load_cycle_1: PPO heavy
+    # - load_cycle_2: even
+    # - load_cycle_5: even
+    # - medium_aircraft: keep as is (oracle-heavy from prior setup)
+    # - snr_congested: DQN heavy, oracle second
     source_scenario_multiplier = {
         "ppo": {
             "load_cycle_1": 2.0,
-            "load_cycle_5": 2.0,
-            "large_aircraft": 2.0,
+            "load_cycle_2": 1.0,
+            "load_cycle_5": 1.0,
+            "medium_aircraft": 1.0,
+            "snr_congested": 1.0,
         },
         "dqn": {
-            "load_cycle_5": 2.0,
+            "load_cycle_1": 1.0,
+            "load_cycle_2": 1.0,
+            "load_cycle_5": 1.0,
+            "medium_aircraft": 1.0,
             "snr_congested": 2.0,
         },
         "oracle": {
-            "load_cycle_5": 2.0,
-            "medium_aircraft": 2.0,
-        },
-        "baseline": {
+            "load_cycle_1": 1.0,
             "load_cycle_2": 1.0,
+            "load_cycle_5": 1.0,
+            "medium_aircraft": 2.0,
+            "snr_congested": 1.5,
+        },
+        "oracle_latency": {
+            "load_cycle_1": 1.0,
+            "load_cycle_2": 1.0,
+            "load_cycle_5": 1.0,
+            "medium_aircraft": 1.25,
+            "snr_congested": 1.0,
+        },
+        "oracle_drop": {
+            "load_cycle_1": 1.0,
+            "load_cycle_2": 1.0,
+            "load_cycle_5": 1.25,
+            "medium_aircraft": 1.25,
+            "snr_congested": 1.5,
         },
     }
     trajectories = []
@@ -245,7 +285,7 @@ def main():
         print(f"Collecting trajectories for scenario: {scenario}")
         episode_budget = {}
         for source, base_count in base_episode_budget.items():
-            default_mult = 0.0 if source == "baseline" else 1.0
+            default_mult = 1.0
             mult = source_scenario_multiplier.get(source, {}).get(scenario, default_mult)
             episode_budget[source] = max(0, int(round(base_count * mult)))
         print(f"Episode budget: {episode_budget}")
@@ -301,17 +341,37 @@ def main():
                 )
             )
 
-        if episode_budget["baseline"] > 0:
-            print("Baseline Trajectories...")
-            baseline_env = BaselineEnv(constellation_name, route, scenario=scenario)
-            baseline_env.earth.Training = True
+        if episode_budget["oracle_latency"] > 0:
+            print("Oracle Latency Trajectories...")
+            oracle_latency_env = PPOEnv(constellation_name, route, scenario=scenario)
+            oracle_latency_env = ActionMasker(oracle_latency_env, mask_fn)
+            oracle_latency_env.env.earth.Training = True
             trajectories.extend(
-                _collect_baseline_trajectories(
-                    baseline_env,
-                    episode_budget["baseline"],
+                _collect_trajectories(
+                    oracle_latency_env,
+                    _oracle_latency_action,
+                    None,
+                    episode_budget["oracle_latency"],
                     quiet=True,
                     scenario=scenario,
-                    source="baseline",
+                    source="oracle_latency",
+                )
+            )
+
+        if episode_budget["oracle_drop"] > 0:
+            print("Oracle Drop Trajectories...")
+            oracle_drop_env = PPOEnv(constellation_name, route, scenario=scenario)
+            oracle_drop_env = ActionMasker(oracle_drop_env, mask_fn)
+            oracle_drop_env.env.earth.Training = True
+            trajectories.extend(
+                _collect_trajectories(
+                    oracle_drop_env,
+                    _oracle_drop_action,
+                    None,
+                    episode_budget["oracle_drop"],
+                    quiet=True,
+                    scenario=scenario,
+                    source="oracle_drop",
                 )
             )
 

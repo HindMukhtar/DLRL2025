@@ -29,8 +29,8 @@ import math
 # ==============================================
 # MODEL SELECTION - Choose which model to test
 # ==============================================
-# Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE', 'BASELINE_LEGACY'
-SELECTED_MODEL = 'ODT'  # Default: ODT
+# Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE', 'ORACLE_LATENCY', 'ORACLE_DROP', 'BASELINE_LEGACY'
+SELECTED_MODEL = 'ODT_FINETUNED'  # Default: ODT
 EVAL_SEED = 42
 
 def append_observation_to_file(obs, step, model_name, filename):
@@ -72,8 +72,8 @@ SCENARIOS = [
     "snr_congested",
 ]
 ODT_MODELS = [
-    ("ODT", "decision_transformer_offline_best.pth")
-    #("ODT_FINETUNED", "decision_transformer_online_finetune.pth"),
+    ("ODT", "decision_transformer_offline_best.pth"),
+    ("ODT_FINETUNED", "decision_transformer_online_finetune_best.pth"),
 ]
 
 
@@ -175,6 +175,95 @@ def predict_valid_action_oracle(base_env, obs, mask):
     return best_action
 
 
+def _oracle_candidate_metrics(base_env, cand):
+    ac = base_env.aircraft
+    qoe = base_env.last_qoe if getattr(base_env, "last_qoe", None) is not None else base_env._refresh_qoe_cache()
+
+    demand_mb = qoe.get("demand_MB", getattr(ac, "demand", 0.0))
+    latency_req_s = qoe.get("latency_req_s", 0.1)
+    deltaT = getattr(ac, "deltaT", 1.0) or 1.0
+
+    beam = cand["beam"]
+    snr = cand["snr"]
+
+    shannon_capacity_mbps = beam.effective_bw * math.log2(1 + 10 ** (snr / 10)) / 1e6
+    demand_mbps = (demand_mb * 8.0) / max(deltaT, 1e-9)
+    served_mbps = min(shannon_capacity_mbps, beam.max_ds_speed, demand_mbps)
+    allocated_mb = (served_mbps * deltaT) / 8.0
+
+    if served_mbps <= 0.0:
+        queue_delay_s = 1000.0
+    else:
+        demand_Mb = demand_mb * 8.0
+        service_Mb = served_mbps * deltaT
+        queue_delay_s = 0.0 if demand_Mb <= service_Mb else (demand_Mb - service_Mb) / served_mbps
+
+    sat = cand["sat"]
+    aircraft_to_sat_m = ac._calculate_3d_distance(sat)
+    sat_to_gateway_m = ac._calculate_3d_distance_to_gateway(sat)
+    c = 299792458.0
+    propagation_latency_s = (aircraft_to_sat_m + sat_to_gateway_m) * 2.0 / c + ac.fixed_processing_latency_s
+    total_latency_s = queue_delay_s + propagation_latency_s
+
+    if latency_req_s > 0:
+        over = max(0.0, total_latency_s - latency_req_s)
+        latency_satisfaction = math.exp(-over / latency_req_s)
+    else:
+        latency_satisfaction = 1.0
+
+    throughput_satisfaction = (allocated_mb / demand_mb) if demand_mb > 0 else 1.0
+    service_drop_s = deltaT if (demand_mb > 0 and allocated_mb <= 0) else 0.0
+
+    return {
+        "total_latency_s": total_latency_s,
+        "latency_satisfaction": latency_satisfaction,
+        "throughput_satisfaction": throughput_satisfaction,
+        "service_drop_s": service_drop_s,
+        "drop_risk": 1.0 if service_drop_s > 0 else 0.0,
+    }
+
+
+def predict_valid_action_oracle_latency(base_env, obs, mask):
+    if not np.any(mask):
+        return -1
+    candidates = base_env.current_beam_candidates
+    best_action = -1
+    best_latency = float("inf")
+    best_drop = float("inf")
+    for i, cand in enumerate(candidates):
+        if i >= len(mask) or not mask[i] or cand is None:
+            continue
+        m = _oracle_candidate_metrics(base_env, cand)
+        if (m["total_latency_s"] < best_latency) or (
+            m["total_latency_s"] == best_latency and m["service_drop_s"] < best_drop
+        ):
+            best_latency = m["total_latency_s"]
+            best_drop = m["service_drop_s"]
+            best_action = i
+    return best_action
+
+
+def predict_valid_action_oracle_drop(base_env, obs, mask):
+    if not np.any(mask):
+        return -1
+    candidates = base_env.current_beam_candidates
+    best_action = -1
+    best_key = None
+    for i, cand in enumerate(candidates):
+        if i >= len(mask) or not mask[i] or cand is None:
+            continue
+        m = _oracle_candidate_metrics(base_env, cand)
+        key = (
+            m["drop_risk"],
+            -m["throughput_satisfaction"],
+            m["total_latency_s"],
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_action = i
+    return best_action
+
+
 def predict_valid_action_baseline_rl(agent, obs, mask, base_env=None):
     """
     Baseline policy on RL wrapper: choose highest-SNR valid candidate.
@@ -224,6 +313,22 @@ for scenario in SCENARIOS:
         agent = None
         env.env.earth.Training = False
         predict_fn = predict_valid_action_oracle
+
+    elif SELECTED_MODEL == 'ORACLE_LATENCY':
+        print("Loading Oracle Latency policy...")
+        env = LEOEnvPPO(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        agent = None
+        env.env.earth.Training = False
+        predict_fn = predict_valid_action_oracle_latency
+
+    elif SELECTED_MODEL == 'ORACLE_DROP':
+        print("Loading Oracle Drop policy...")
+        env = LEOEnvPPO(constellation_name, route, scenario=scenario)
+        env = ActionMasker(env, mask_fn)
+        agent = None
+        env.env.earth.Training = False
+        predict_fn = predict_valid_action_oracle_drop
         
     elif SELECTED_MODEL in ('ODT', 'ODT_FINETUNED'):
         pass
@@ -245,7 +350,7 @@ for scenario in SCENARIOS:
         predict_fn = None
         
     else:
-        raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'ODT_FINETUNED', 'DQN', 'PPO', 'BASELINE', 'ORACLE', 'BASELINE_LEGACY'")
+        raise ValueError(f"Invalid model selection: {SELECTED_MODEL}. Choose from 'ODT', 'ODT_FINETUNED', 'DQN', 'PPO', 'BASELINE', 'ORACLE', 'ORACLE_LATENCY', 'ORACLE_DROP', 'BASELINE_LEGACY'")
 
     if SELECTED_MODEL != 'ODT':
         print(f"Model {SELECTED_MODEL} loaded successfully!")
@@ -271,7 +376,7 @@ for scenario in SCENARIOS:
 
             if model_label == 'BASELINE_LEGACY':
                 obs, reward, done, truncated, info = env.step()
-            elif model_label == 'ORACLE':
+            elif model_label in ('ORACLE', 'ORACLE_LATENCY', 'ORACLE_DROP'):
                 mask = env.env._get_action_mask()
                 action = predict_fn(env.env, obs, mask)
                 obs, reward, done, truncated, info = env.env.step(action)
@@ -324,7 +429,7 @@ for scenario in SCENARIOS:
         print("- Periodic garbage collection")
         print("- No step limit - full route completed")
 
-    if SELECTED_MODEL in ('ODT', 'ODT_FINETUNED'):
+    if SELECTED_MODEL in ('ODT_FINETUNED'):
         selected_models = ODT_MODELS
         if SELECTED_MODEL == 'ODT_FINETUNED':
             selected_models = [m for m in ODT_MODELS if m[0] == 'ODT_FINETUNED']

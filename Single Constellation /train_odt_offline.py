@@ -61,9 +61,9 @@ def main():
     dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
     output_path = os.path.join(base_dir, "decision_transformer_offline.pth")
     best_path = os.path.join(base_dir, "decision_transformer_offline_best.pth")
-    resume_path = best_path if os.path.exists(best_path) else None
+    #resume_path = best_path if os.path.exists(best_path) else None
 
-    #resume_path = None 
+    resume_path = None 
     with open(dataset_path, "rb") as f:
         trajectories = pickle.load(f)
 

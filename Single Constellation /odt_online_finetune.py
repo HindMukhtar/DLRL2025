@@ -192,13 +192,16 @@ def _evaluate_composite(agent, constellation_name, route, state_dim, action_dim,
             latency_viol.append(1.0 if latency_s > latency_req else 0.0)
             obs = next_obs
 
+        hard = scenario in {"snr_congested", "load_cycle_1"}
         rows.append(
             {
+                "scenario": scenario,
                 "reward": rewards,
                 "ratio": float(np.mean(ratios)) if ratios else 0.0,
                 "drop": float(np.sum(drops)) if drops else 0.0,
                 "handover": float(max(handovers)) if handovers else 0.0,
                 "lat_viol": float(np.mean(latency_viol)) if latency_viol else 0.0,
+                "w": 2.0 if hard else 1.0,
             }
         )
 
@@ -206,17 +209,23 @@ def _evaluate_composite(agent, constellation_name, route, state_dim, action_dim,
     if not rows:
         return -1e9
     df = pd.DataFrame(rows)
+    w = df["w"].to_numpy(dtype=np.float64)
+    w = w / np.sum(w)
+    ratio = float(np.sum(df["ratio"].to_numpy(dtype=np.float64) * w))
+    lat_viol = float(np.sum(df["lat_viol"].to_numpy(dtype=np.float64) * w))
+    drop = float(np.sum(df["drop"].to_numpy(dtype=np.float64) * w))
+    handover = float(np.sum(df["handover"].to_numpy(dtype=np.float64) * w))
     return float(
-        (1.0 * df["ratio"].mean())
-        - (0.6 * df["lat_viol"].mean())
-        - (0.02 * df["drop"].mean())
-        - (0.001 * df["handover"].mean())
+        (1.0 * ratio)
+        - (0.9 * lat_viol)
+        - (0.03 * drop)
+        - (0.001 * handover)
     )
 
 
 def main():
     base_dir = os.path.dirname(__file__)
-    model_path = os.path.join(base_dir, "decision_transformer_offline.pth")
+    model_path = os.path.join(base_dir, "decision_transformer_offline_best.pth")
     dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
     output_path = os.path.join(base_dir, "decision_transformer_online_finetune.pth")
     best_output_path = os.path.join(base_dir, "decision_transformer_online_finetune_best.pth")
@@ -231,20 +240,19 @@ def main():
 
     # Weighted scenario schedule (focus weak scenarios).
     scenario_weights = {
-        "load_cycle_1": 3,
+        "load_cycle_1": 6,
         "load_cycle_2": 1,
         "load_cycle_5": 1,
         "medium_aircraft": 1,
-        "large_aircraft": 1,
-        "snr_congested": 1,
+        "snr_congested": 6,
     }
-    sweep_scenarios = ["load_cycle_1"]
-    eval_scenarios = ["load_cycle_1", "large_aircraft", "snr_congested"]
+    sweep_scenarios = ["snr_congested", "load_cycle_1"]
+    eval_scenarios = ["load_cycle_1", "load_cycle_5", "medium_aircraft", "snr_congested"]
 
     finetune_rounds = 3
     train_interval = 5
     batch_size = 96
-    offline_frac = 0.7
+    offline_frac = 0.6
     rtg_sweep_every_episodes = 4
     eval_every_episodes = 2
 
@@ -289,6 +297,7 @@ def main():
     global_step = 0
     losses = []
 
+    lr_decay_start = max(1, int(0.6 * len(schedule)))
     for ep_idx, scenario in enumerate(schedule, start=1):
         print(f"Fine-tuning episode {ep_idx}/{len(schedule)} on scenario: {scenario}")
         env = LEOEnv(constellation_name, route, scenario=scenario)
@@ -339,6 +348,11 @@ def main():
                 best_eval = eval_score
                 agent.save(best_output_path)
                 print(f"[Eval] New best checkpoint saved: {best_output_path}")
+
+        if ep_idx == lr_decay_start:
+            agent.optimizer.param_groups[0]["lr"] = 1e-6
+            offline_frac = 0.5
+            print("[Schedule] Late-stage settings: lr=1e-6, offline_frac=0.5")
 
     agent.save(output_path)
     print(f"Saved fine-tuned ODT model to {output_path}")
