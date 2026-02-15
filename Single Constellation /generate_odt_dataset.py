@@ -208,6 +208,9 @@ def _oracle_drop_action(env):
 
 def main():
     base_dir = os.path.dirname(__file__)
+    base_dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
+    aug_dataset_path = os.path.join(base_dir, "odt_offline_dataset_aug.pkl")
+    merged_dataset_path = os.path.join(base_dir, "odt_offline_dataset_merged.pkl")
     input_params = pd.read_csv(os.path.join(base_dir, "input.csv"))
     constellation_name = input_params["Constellation"][0]
     route, _ = load_route_from_csv(os.path.join(base_dir, "route_5s_interpolated.csv"), skip_rows=0)
@@ -219,55 +222,45 @@ def main():
         "snr_congested",
     ]
 
-    # Base per-scenario trajectory budget by source.
-    base_episode_budget = {
-        "ppo": 12,
-        "oracle": 12,
-        "oracle_latency": 6,
-        "oracle_drop": 6,
-        "dqn": 12,
-    }
-    # Per-source, per-scenario multipliers to shape the dataset:
-    # - load_cycle_1: PPO heavy
-    # - load_cycle_2: even
-    # - load_cycle_5: even
-    # - medium_aircraft: keep as is (oracle-heavy from prior setup)
-    # - snr_congested: DQN heavy, oracle second
-    source_scenario_multiplier = {
-        "ppo": {
-            "load_cycle_1": 2.0,
-            "load_cycle_2": 1.0,
-            "load_cycle_5": 1.0,
-            "medium_aircraft": 1.0,
-            "snr_congested": 1.0,
+    # Per-scenario episode budgets by source.
+    # Target: ~50 episodes/scenario while keeping all scenarios represented.
+    # - load_cycle_1: PPO + oracle_latency + oracle_drop dominate
+    # - snr_congested: DQN dominates, oracle second
+    scenario_episode_budget = {
+        "load_cycle_1": {
+            "ppo": 16,
+            "oracle_latency": 14,
+            "oracle_drop": 12,
+            "oracle": 6,
+            "dqn": 2,
         },
-        "dqn": {
-            "load_cycle_1": 1.0,
-            "load_cycle_2": 1.0,
-            "load_cycle_5": 1.0,
-            "medium_aircraft": 1.0,
-            "snr_congested": 2.0,
+        "snr_congested": {
+            "dqn": 36,
+            "oracle": 3,
+            "oracle_drop": 8,
+            "oracle_latency": 1,
+            "ppo": 2,
         },
-        "oracle": {
-            "load_cycle_1": 1.0,
-            "load_cycle_2": 1.0,
-            "load_cycle_5": 1.0,
-            "medium_aircraft": 2.0,
-            "snr_congested": 1.5,
+        "load_cycle_2": {
+            "ppo": 10,
+            "dqn": 10,
+            "oracle": 10,
+            "oracle_latency": 10,
+            "oracle_drop": 10,
         },
-        "oracle_latency": {
-            "load_cycle_1": 1.0,
-            "load_cycle_2": 1.0,
-            "load_cycle_5": 1.0,
-            "medium_aircraft": 1.25,
-            "snr_congested": 1.0,
+        "load_cycle_5": {
+            "ppo": 10,
+            "dqn": 10,
+            "oracle": 10,
+            "oracle_latency": 10,
+            "oracle_drop": 10,
         },
-        "oracle_drop": {
-            "load_cycle_1": 1.0,
-            "load_cycle_2": 1.0,
-            "load_cycle_5": 1.25,
-            "medium_aircraft": 1.25,
-            "snr_congested": 1.5,
+        "medium_aircraft": {
+            "ppo": 10,
+            "dqn": 10,
+            "oracle": 10,
+            "oracle_latency": 10,
+            "oracle_drop": 10,
         },
     }
     trajectories = []
@@ -283,14 +276,10 @@ def main():
 
     for scenario in scenarios:
         print(f"Collecting trajectories for scenario: {scenario}")
-        episode_budget = {}
-        for source, base_count in base_episode_budget.items():
-            default_mult = 1.0
-            mult = source_scenario_multiplier.get(source, {}).get(scenario, default_mult)
-            episode_budget[source] = max(0, int(round(base_count * mult)))
+        episode_budget = scenario_episode_budget.get(scenario, {})
         print(f"Episode budget: {episode_budget}")
 
-        if episode_budget["ppo"] > 0:
+        if episode_budget.get("ppo", 0) > 0:
             print("PPO Agent Trajectories...")
             ppo_env = PPOEnv(constellation_name, route, scenario=scenario)
             ppo_env = ActionMasker(ppo_env, mask_fn)
@@ -300,14 +289,14 @@ def main():
                     ppo_env,
                     predict_valid_action,
                     ppo_model,
-                    episode_budget["ppo"],
+                    episode_budget.get("ppo", 0),
                     quiet=True,
                     scenario=scenario,
                     source="ppo",
                 )
             )
 
-        if episode_budget["dqn"] > 0:
+        if episode_budget.get("dqn", 0) > 0:
             print("DQN Agent Trajectories...")
             dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
             dqn_env = ActionMasker(dqn_env, mask_fn)
@@ -317,14 +306,14 @@ def main():
                     dqn_env,
                     predict_valid_action_dqn,
                     dqn_model,
-                    episode_budget["dqn"],
+                    episode_budget.get("dqn", 0),
                     quiet=True,
                     scenario=scenario,
                     source="dqn",
                 )
             )
 
-        if episode_budget["oracle"] > 0:
+        if episode_budget.get("oracle", 0) > 0:
             print("Oracle Agent Trajectories...")
             oracle_env = PPOEnv(constellation_name, route, scenario=scenario)
             oracle_env = ActionMasker(oracle_env, mask_fn)
@@ -334,14 +323,14 @@ def main():
                     oracle_env,
                     _oracle_action,
                     None,
-                    episode_budget["oracle"],
+                    episode_budget.get("oracle", 0),
                     quiet=True,
                     scenario=scenario,
                     source="oracle",
                 )
             )
 
-        if episode_budget["oracle_latency"] > 0:
+        if episode_budget.get("oracle_latency", 0) > 0:
             print("Oracle Latency Trajectories...")
             oracle_latency_env = PPOEnv(constellation_name, route, scenario=scenario)
             oracle_latency_env = ActionMasker(oracle_latency_env, mask_fn)
@@ -351,14 +340,14 @@ def main():
                     oracle_latency_env,
                     _oracle_latency_action,
                     None,
-                    episode_budget["oracle_latency"],
+                    episode_budget.get("oracle_latency", 0),
                     quiet=True,
                     scenario=scenario,
                     source="oracle_latency",
                 )
             )
 
-        if episode_budget["oracle_drop"] > 0:
+        if episode_budget.get("oracle_drop", 0) > 0:
             print("Oracle Drop Trajectories...")
             oracle_drop_env = PPOEnv(constellation_name, route, scenario=scenario)
             oracle_drop_env = ActionMasker(oracle_drop_env, mask_fn)
@@ -368,18 +357,33 @@ def main():
                     oracle_drop_env,
                     _oracle_drop_action,
                     None,
-                    episode_budget["oracle_drop"],
+                    episode_budget.get("oracle_drop", 0),
                     quiet=True,
                     scenario=scenario,
                     source="oracle_drop",
                 )
             )
 
-    output_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
-    with open(output_path, "wb") as f:
+    with open(aug_dataset_path, "wb") as f:
         pickle.dump(trajectories, f)
+    print(f"Saved augmentation dataset with {len(trajectories)} trajectories to {aug_dataset_path}")
 
-    print(f"Saved {len(trajectories)} trajectories to {output_path}")
+    # Merge augmentation with existing base dataset into a new merged file.
+    if os.path.exists(base_dataset_path):
+        with open(base_dataset_path, "rb") as f:
+            base_trajectories = pickle.load(f)
+        merged_trajectories = list(base_trajectories) + list(trajectories)
+        with open(merged_dataset_path, "wb") as f:
+            pickle.dump(merged_trajectories, f)
+        print(
+            f"Merged dataset saved to {merged_dataset_path} "
+            f"(base={len(base_trajectories)}, aug={len(trajectories)}, total={len(merged_trajectories)})"
+        )
+    else:
+        print(
+            f"Base dataset not found at {base_dataset_path}. "
+            f"Only augmentation dataset was saved."
+        )
 
 
 if __name__ == "__main__":

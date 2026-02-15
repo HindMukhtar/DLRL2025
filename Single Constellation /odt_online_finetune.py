@@ -226,7 +226,7 @@ def _evaluate_composite(agent, constellation_name, route, state_dim, action_dim,
 def main():
     base_dir = os.path.dirname(__file__)
     model_path = os.path.join(base_dir, "decision_transformer_offline_best.pth")
-    dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
+    dataset_path = os.path.join(base_dir, "odt_offline_dataset_merged.pkl")
     output_path = os.path.join(base_dir, "decision_transformer_online_finetune.pth")
     best_output_path = os.path.join(base_dir, "decision_transformer_online_finetune_best.pth")
 

@@ -30,7 +30,7 @@ import math
 # MODEL SELECTION - Choose which model to test
 # ==============================================
 # Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE', 'ORACLE_LATENCY', 'ORACLE_DROP', 'BASELINE_LEGACY'
-SELECTED_MODEL = 'ODT_FINETUNED'  # Default: ODT
+SELECTED_MODEL = 'ODT'  # Default: ODT
 EVAL_SEED = 42
 
 def append_observation_to_file(obs, step, model_name, filename):
@@ -72,8 +72,8 @@ SCENARIOS = [
     "snr_congested",
 ]
 ODT_MODELS = [
-    ("ODT", "decision_transformer_offline_best.pth"),
-    ("ODT_FINETUNED", "decision_transformer_online_finetune_best.pth"),
+    #("ODT", "decision_transformer_offline_best.pth"),
+    ("ODT_FINETUNED", "decision_transformer_online_finetune_best_20.pth"),
 ]
 
 
@@ -429,7 +429,7 @@ for scenario in SCENARIOS:
         print("- Periodic garbage collection")
         print("- No step limit - full route completed")
 
-    if SELECTED_MODEL in ('ODT_FINETUNED'):
+    if SELECTED_MODEL in ('ODT', 'ODT_FINETUNED'):
         selected_models = ODT_MODELS
         if SELECTED_MODEL == 'ODT_FINETUNED':
             selected_models = [m for m in ODT_MODELS if m[0] == 'ODT_FINETUNED']

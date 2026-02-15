@@ -58,7 +58,7 @@ def _concat_batches(batches):
 
 def main():
     base_dir = os.path.dirname(__file__)
-    dataset_path = os.path.join(base_dir, "odt_offline_dataset.pkl")
+    dataset_path = os.path.join(base_dir, "odt_offline_dataset_merged.pkl")
     output_path = os.path.join(base_dir, "decision_transformer_offline.pth")
     best_path = os.path.join(base_dir, "decision_transformer_offline_best.pth")
     #resume_path = best_path if os.path.exists(best_path) else None
