@@ -3,10 +3,8 @@ geopy
 simpy
 matplotlib
 numba
+scipy
 cartopy
 stable-baselines3
 sb3-contrib
-torch 
-cartopy
-stable_baselines3
-sb3_contrib
+torch
