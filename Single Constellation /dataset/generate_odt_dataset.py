@@ -4,6 +4,7 @@ import contextlib
 import io
 import pickle
 import random
+import json
 
 import numpy as np
 import pandas as pd
@@ -42,14 +43,28 @@ def _resolve_model_path(base_dir, name):
         return model_path
     return os.path.join(base_dir, name)
 
-def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario=None, source=None):
+def _collect_trajectories(
+    env,
+    predict_fn,
+    model,
+    episodes,
+    quiet=True,
+    scenario=None,
+    source=None,
+    seed_base=42,
+    episode_seeds=None,
+):
     trajectories = []
     for ep in range(episodes):
         print(f"Episode {ep+1}/{episodes}")
         sink = io.StringIO() if quiet else None
         cm = contextlib.redirect_stdout(sink) if quiet else contextlib.nullcontext()
         with cm:
-            obs, info = env.reset()
+            if episode_seeds is not None and ep < len(episode_seeds):
+                episode_seed = int(episode_seeds[ep])
+            else:
+                episode_seed = int(seed_base) + int(ep)
+            obs, info = env.reset(seed=episode_seed)
             done = False
             truncated = False
 
@@ -60,8 +75,8 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario
             while not (done or truncated):
                 mask = env.env._get_action_mask()
                 if not np.any(mask):
-                    break
-                if model is None:
+                    action = 0
+                elif model is None:
                     action = predict_fn(env)
                 else:
                     action = predict_fn(model, obs, mask)
@@ -79,6 +94,8 @@ def _collect_trajectories(env, predict_fn, model, episodes, quiet=True, scenario
                         "rewards": np.array(rewards, dtype=np.float32),
                         "scenario": scenario,
                         "source": source,
+                        "seed": int(seed_base),
+                        "episode_seed": int(episode_seed),
                     }
                 )
     return trajectories
@@ -226,9 +243,7 @@ def main():
     dataset_dir = SCRIPT_DIR
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(os.path.join(base_dir, MODELS_DIRNAME), exist_ok=True)
-    base_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset.pkl")
-    aug_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_aug.pkl")
-    merged_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_merged.pkl")
+    aug_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_aug_multisim.pkl")
     input_path = os.path.join(base_dir, "Inputs", "input.csv")
     if not os.path.exists(input_path):
         input_path = os.path.join(base_dir, "input.csv")
@@ -242,9 +257,11 @@ def main():
         "load_cycle_1",
         "load_cycle_2",
         "load_cycle_5",
+        "large_aircraft",
         "medium_aircraft",
         "snr_congested",
     ]
+    dataset_seeds = [41, 42, 43, 44, 45, 46, 47]
 
     # Per-scenario episode budgets by source.
     # Target: ~50 episodes/scenario while keeping all scenarios represented.
@@ -286,128 +303,137 @@ def main():
             "oracle_latency": 10,
             "oracle_drop": 10,
         },
+        "large_aircraft": {
+            "ppo": 10,
+            "dqn": 10,
+            "oracle": 10,
+            "oracle_latency": 10,
+            "oracle_drop": 10,
+        },
     }
     trajectories = []
-
-    np.random.seed(42)
-    random.seed(42)
-    torch.manual_seed(42)
 
     ppo_model_path = _resolve_model_path(base_dir, "handover_ppo_agent")
     ppo_model = MaskablePPO.load(ppo_model_path, device="cpu")
     dqn_model_path = _resolve_model_path(base_dir, "handover_dqn_agent")
     dqn_model = DQN.load(dqn_model_path, device="cpu")
 
-    for scenario in scenarios:
-        print(f"Collecting trajectories for scenario: {scenario}")
-        episode_budget = scenario_episode_budget.get(scenario, {})
-        print(f"Episode budget: {episode_budget}")
+    for seed in dataset_seeds:
+        print(f"\n========== DATASET SEED: {seed} ==========")
+        os.environ["EVAL_SEED"] = str(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
 
-        if episode_budget.get("ppo", 0) > 0:
-            print("PPO Agent Trajectories...")
-            ppo_env = PPOEnv(constellation_name, route, scenario=scenario)
-            ppo_env = ActionMasker(ppo_env, mask_fn)
-            ppo_env.env.earth.Training = True
-            trajectories.extend(
-                _collect_trajectories(
-                    ppo_env,
-                    predict_valid_action,
-                    ppo_model,
-                    episode_budget.get("ppo", 0),
-                    quiet=True,
-                    scenario=scenario,
-                    source="ppo",
-                )
-            )
+        for scenario in scenarios:
+            print(f"Collecting trajectories for scenario: {scenario}")
+            episode_budget = scenario_episode_budget.get(scenario, {})
+            print(f"Episode budget: {episode_budget}")
 
-        if episode_budget.get("dqn", 0) > 0:
-            print("DQN Agent Trajectories...")
-            dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
-            dqn_env = ActionMasker(dqn_env, mask_fn)
-            dqn_env.env.earth.Training = True
-            trajectories.extend(
-                _collect_trajectories(
-                    dqn_env,
-                    predict_valid_action_dqn,
-                    dqn_model,
-                    episode_budget.get("dqn", 0),
-                    quiet=True,
-                    scenario=scenario,
-                    source="dqn",
+            if episode_budget.get("ppo", 0) > 0:
+                print("PPO Agent Trajectories...")
+                ppo_env = PPOEnv(constellation_name, route, scenario=scenario)
+                ppo_env = ActionMasker(ppo_env, mask_fn)
+                ppo_env.env.earth.Training = True
+                trajectories.extend(
+                    _collect_trajectories(
+                        ppo_env,
+                        predict_valid_action,
+                        ppo_model,
+                        episode_budget.get("ppo", 0),
+                        quiet=True,
+                        scenario=scenario,
+                        source="ppo",
+                        seed_base=seed * 10000,
+                    )
                 )
-            )
 
-        if episode_budget.get("oracle", 0) > 0:
-            print("Oracle Agent Trajectories...")
-            oracle_env = PPOEnv(constellation_name, route, scenario=scenario)
-            oracle_env = ActionMasker(oracle_env, mask_fn)
-            oracle_env.env.earth.Training = True
-            trajectories.extend(
-                _collect_trajectories(
-                    oracle_env,
-                    _oracle_action,
-                    None,
-                    episode_budget.get("oracle", 0),
-                    quiet=True,
-                    scenario=scenario,
-                    source="oracle",
+            if episode_budget.get("dqn", 0) > 0:
+                print("DQN Agent Trajectories...")
+                dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
+                dqn_env = ActionMasker(dqn_env, mask_fn)
+                dqn_env.env.earth.Training = True
+                trajectories.extend(
+                    _collect_trajectories(
+                        dqn_env,
+                        predict_valid_action_dqn,
+                        dqn_model,
+                        episode_budget.get("dqn", 0),
+                        quiet=True,
+                        scenario=scenario,
+                        source="dqn",
+                        seed_base=seed * 10000,
+                    )
                 )
-            )
 
-        if episode_budget.get("oracle_latency", 0) > 0:
-            print("Oracle Latency Trajectories...")
-            oracle_latency_env = PPOEnv(constellation_name, route, scenario=scenario)
-            oracle_latency_env = ActionMasker(oracle_latency_env, mask_fn)
-            oracle_latency_env.env.earth.Training = True
-            trajectories.extend(
-                _collect_trajectories(
-                    oracle_latency_env,
-                    _oracle_latency_action,
-                    None,
-                    episode_budget.get("oracle_latency", 0),
-                    quiet=True,
-                    scenario=scenario,
-                    source="oracle_latency",
+            if episode_budget.get("oracle", 0) > 0:
+                print("Oracle Agent Trajectories...")
+                oracle_env = PPOEnv(constellation_name, route, scenario=scenario)
+                oracle_env = ActionMasker(oracle_env, mask_fn)
+                oracle_env.env.earth.Training = True
+                trajectories.extend(
+                    _collect_trajectories(
+                        oracle_env,
+                        _oracle_action,
+                        None,
+                        episode_budget.get("oracle", 0),
+                        quiet=True,
+                        scenario=scenario,
+                        source="oracle",
+                        seed_base=seed * 10000,
+                    )
                 )
-            )
 
-        if episode_budget.get("oracle_drop", 0) > 0:
-            print("Oracle Drop Trajectories...")
-            oracle_drop_env = PPOEnv(constellation_name, route, scenario=scenario)
-            oracle_drop_env = ActionMasker(oracle_drop_env, mask_fn)
-            oracle_drop_env.env.earth.Training = True
-            trajectories.extend(
-                _collect_trajectories(
-                    oracle_drop_env,
-                    _oracle_drop_action,
-                    None,
-                    episode_budget.get("oracle_drop", 0),
-                    quiet=True,
-                    scenario=scenario,
-                    source="oracle_drop",
+            if episode_budget.get("oracle_latency", 0) > 0:
+                print("Oracle Latency Trajectories...")
+                oracle_latency_env = PPOEnv(constellation_name, route, scenario=scenario)
+                oracle_latency_env = ActionMasker(oracle_latency_env, mask_fn)
+                oracle_latency_env.env.earth.Training = True
+                trajectories.extend(
+                    _collect_trajectories(
+                        oracle_latency_env,
+                        _oracle_latency_action,
+                        None,
+                        episode_budget.get("oracle_latency", 0),
+                        quiet=True,
+                        scenario=scenario,
+                        source="oracle_latency",
+                        seed_base=seed * 10000,
+                    )
                 )
-            )
+
+            if episode_budget.get("oracle_drop", 0) > 0:
+                print("Oracle Drop Trajectories...")
+                oracle_drop_env = PPOEnv(constellation_name, route, scenario=scenario)
+                oracle_drop_env = ActionMasker(oracle_drop_env, mask_fn)
+                oracle_drop_env.env.earth.Training = True
+                trajectories.extend(
+                    _collect_trajectories(
+                        oracle_drop_env,
+                        _oracle_drop_action,
+                        None,
+                        episode_budget.get("oracle_drop", 0),
+                        quiet=True,
+                        scenario=scenario,
+                        source="oracle_drop",
+                        seed_base=seed * 10000,
+                    )
+                )
 
     with open(aug_dataset_path, "wb") as f:
         pickle.dump(trajectories, f)
     print(f"Saved augmentation dataset with {len(trajectories)} trajectories to {aug_dataset_path}")
-
-    # Merge augmentation with existing base dataset into a new merged file.
-    if os.path.exists(base_dataset_path):
-        with open(base_dataset_path, "rb") as f:
-            base_trajectories = pickle.load(f)
-        merged_trajectories = list(base_trajectories) + list(trajectories)
-        with open(merged_dataset_path, "wb") as f:
-            pickle.dump(merged_trajectories, f)
-        print(
-            f"Merged dataset saved to {merged_dataset_path} "
-            f"(base={len(base_trajectories)}, aug={len(trajectories)}, total={len(merged_trajectories)})"
+    split_meta_path = os.path.join(dataset_dir, "odt_dataset_seed_split_multisim.json")
+    with open(split_meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dataset_seeds": dataset_seeds,
+                "scenarios": scenarios,
+            },
+            f,
+            indent=2,
         )
-    else:
-        print(
-            f"Base dataset not found at {base_dataset_path}. "
-            f"Only augmentation dataset was saved."
-        )
+    print(f"Saved dataset seed metadata to {split_meta_path}")
 
 
 if __name__ == "__main__":

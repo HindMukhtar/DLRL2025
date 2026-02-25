@@ -1120,32 +1120,68 @@ class Passenger:
         self.ID = ID
         self.application = application 
         self.rng = rng or random.Random()
-        self.APP_PROBS = {
+        base_probs = {
                         "streaming":      0.25,
                         "voip":           0.10,
                         "email":          0.10,
-                        "web":            0.30,
+                        "web":            0.35,
                         "file_transfer":  0.10,
                         "video_conference": 0.15,
                     }
         if Passenger.scenario == "demand_aware":
-            self.APP_PROBS = {
+            base_probs = {
                         "streaming":      0.45,
                         "voip":           0.03,
-                        "email":          0.02,
+                        "email":          0.03,
                         "web":            0.10,
                         "file_transfer":  0.15,
                         "video_conference": 0.25,
                     }
+        # Seeded per-passenger start chance and app mix.
+        self.start_prob = self.rng.uniform(0.65, 0.90)
+        self.APP_PROBS = self._sample_app_probs(base_probs, concentration=14.0)
         
         self.APP_CLASSES = {
-                            "streaming":        lambda: StreamingApp(),
-                            "voip":             lambda: VoIPApp(),
-                            "email":            lambda: EmailApp(),
-                            "web":              lambda: WebBrowsingApp(),
-                            "file_transfer":    lambda: FileTransferApp(),
-                            "video_conference": lambda: VideoConferenceApp(),  
+                            "streaming":        self._make_streaming_app,
+                            "voip":             self._make_voip_app,
+                            "email":            self._make_email_app,
+                            "web":              self._make_web_app,
+                            "file_transfer":    self._make_file_transfer_app,
+                            "video_conference": self._make_video_conference_app,  
                         }
+
+    def _sample_app_probs(self, base_probs, concentration=50.0):
+        """
+        Sample a seeded probability vector around base_probs.
+        Higher concentration means less variance around the base mix.
+        """
+        keys = list(base_probs.keys())
+        draws = []
+        for k in keys:
+            alpha = max(1e-3, float(base_probs[k]) * concentration)
+            draws.append(self.rng.gammavariate(alpha, 1.0))
+        total = sum(draws)
+        if total <= 0:
+            return dict(base_probs)
+        return {k: d / total for k, d in zip(keys, draws)}
+
+    def _make_streaming_app(self):
+        return StreamingApp()
+
+    def _make_voip_app(self):
+        return VoIPApp()
+
+    def _make_email_app(self):
+        return EmailApp()
+
+    def _make_web_app(self):
+        return WebBrowsingApp()
+
+    def _make_file_transfer_app(self):
+        return FileTransferApp()
+
+    def _make_video_conference_app(self):
+        return VideoConferenceApp()
 
     def step_application(self, dt_seconds=10):
         # 1) If active, advance session time
@@ -1156,8 +1192,7 @@ class Passenger:
         
         # 2) If idle, maybe start a new app
         if self.application is None:
-            start_prob = 0.5  # 50% chance per 10 seconds
-            if self.rng.random() < start_prob:
+            if self.rng.random() < self.start_prob:
                 apps  = list(self.APP_PROBS.keys())
                 probs = list(self.APP_PROBS.values())
                 app_name = self.rng.choices(apps, weights=probs, k=1)[0]
@@ -1170,7 +1205,8 @@ class Passenger:
 
         
 class StreamingApp:
-    def __init__(self, app_type='video', base_demand_mbps=5, latency_ms=300, duration=40*60, sessionid = None):
+    def __init__(self, app_type='video', base_demand_mbps=25, latency_ms=300, duration=40*60, sessionid = None):
+        # Changed demand from 5 Mbps to 25 Mbps 
         self.sessionid = sessionid
         self.app_type = app_type
         self.base_demand_mbps = base_demand_mbps
@@ -1276,7 +1312,8 @@ class FileTransferApp:
             return 0
 
 class VideoConferenceApp:
-    def __init__(self, app_type='video_conference', base_demand_mbps=2, latency_ms=150, duration=45*60, sessionid = None):
+    def __init__(self, app_type='video_conference', base_demand_mbps=2, latency_ms=50, duration=45*60, sessionid = None):
+        #Changed latnecy from 150 ms to 50 ms 
         self.sessionid = sessionid
         self.app_type = app_type
         self.base_demand_mbps = base_demand_mbps

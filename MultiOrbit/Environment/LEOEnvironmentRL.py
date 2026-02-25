@@ -171,6 +171,10 @@ class Beam:
         self.load = load # Current number of users connected
         self.snr = snr # Base SNR, will be adjusted for user position
         self.id = id  # Optional: unique identifier for the beam
+        self.constellation = constellation
+        phase_key = f"{self.constellation}|{self.id}|{self.center_lat:.3f}|{self.center_lon:.3f}"
+        phase_hash = sum((i + 1) * ord(ch) for i, ch in enumerate(phase_key))
+        self.phase_jitter = (phase_hash % 10007) / 10007.0
         self.load_amplitude = 0.5 
         self.load_frequency = 2 * math.pi / 100 
         self.load_phase = random.uniform(0, 2 * math.pi)
@@ -344,11 +348,9 @@ class Beam:
             base_density = self.base_load
 
         cycle_s = max(1.0, Beam.load_cycle_s)
-        # Deterministic per-beam phase offset (longitude + beam-id jitter) to avoid full synchronization.
+        # Same global cycle timing for all networks, but beam-specific (constellation-aware) offsets.
         lon_phase = (self.center_lon + 180.0) / 360.0
-        id_hash = sum(ord(c) for c in str(self.id)) if self.id is not None else 0
-        id_phase = (id_hash % 997) / 997.0
-        beam_phase = (lon_phase + 0.1 * id_phase) % 1.0
+        beam_phase = (0.15 * lon_phase + 0.85 * self.phase_jitter) % 1.0
         phase = 0.5 + 0.5 * math.sin(2 * math.pi * ((time_seconds / cycle_s) + beam_phase) - math.pi / 2.0)
         load_min = 0.05 + 0.15 * base_density
         # Allow slight overshoot above 1.0 so clipping produces full saturation windows.
@@ -420,26 +422,27 @@ class Satellite:
         self.n_sat = n_sat
         # Intelsat 0_0 payload model: satellite-level configurable bandwidth pool.
         # Value comes from 326 equivalent 36 MHz units.
-        self.payload_total_bw_hz = 326.0 * 36e6
-        self.payload_min_bw_per_beam_hz = 1e6
-        self.payload_alloc_alpha = 1.5
+        if constellation_type == "Intelsat" and self.i_in_plane == 0:
+            self.payload_total_bw_hz = 326.0 * 36e6
+            self.payload_min_bw_per_beam_hz = 1e6
+            self.payload_alloc_alpha = 1.5
 
-        # downlink params
-        f = 20e9  # Carrier frequency GEO to ground (Hz)
-        B = 500e6  # Maximum bandwidth
-        maxPtx = 10  # Maximum transmission power in W
-        Adtx = 0.26  # Transmitter antenna diameter in m
-        Adrx = 0.33  # Receiver antenna diameter in m
-        pL = 0.3  # Pointing loss in dB
-        Nf = 1.5  # Noise figure in dB
-        Tn = 50  # Noise temperature in K
-        min_rate = 10e3  # Minimum rate in kbps
-        self.ngeo2gt = RFlink(f, B, maxPtx, Adtx, Adrx, pL, Nf, Tn, min_rate)
-        self.downRate = 0
-        self.base_snr_at_center = 0 # To store the base SNR for beams
+        # # downlink params
+        # f = 20e9  # Carrier frequency GEO to ground (Hz)
+        # B = 500e6  # Maximum bandwidth
+        # maxPtx = 10  # Maximum transmission power in W
+        # Adtx = 0.26  # Transmitter antenna diameter in m
+        # Adrx = 0.33  # Receiver antenna diameter in m
+        # pL = 0.3  # Pointing loss in dB
+        # Nf = 1.5  # Noise figure in dB
+        # Tn = 50  # Noise temperature in K
+        # min_rate = 10e3  # Minimum rate in kbps
+        # self.ngeo2gt = RFlink(f, B, maxPtx, Adtx, Adrx, pL, Nf, Tn, min_rate)
+        # self.downRate = 0
+        # self.base_snr_at_center = 0 # To store the base SNR for beams
 
-        # simpy
-        self.env = env
+        # # simpy
+        # self.env = env
 
         # Satellite beams - assuming OneWeb beams right now 
         self.beams = []
@@ -449,7 +452,7 @@ class Satellite:
     def _apply_intelsat_payload_allocation(self):
         """
         Allocate Intelsat satellite-level payload bandwidth across beams.
-        Applied only to Intelsat satellite 0_0 (i_in_plane == 0), as requested.
+        Applied only to Intelsat satellite 0_0 (i_in_plane == 0).
         """
         if self.constellationType != "Intelsat" or self.i_in_plane != 0 or not self.beams:
             return
@@ -504,22 +507,22 @@ class Satellite:
         return centers[:count]
 
     def init_beams(self):
-        # OneWeb: coverage area is a square, divided into 16 horizontal strips (vertically stacked)
-        total_area_km2 = 1_718_000
-        side_km = total_area_km2 ** 0.5  # ≈ 1310 km
-        n_beams = 16
-        beam_width_km = side_km
-        beam_height_km = side_km / n_beams  # ≈ 81.9 km
-
-        deg_per_km = 1 / 111  # Approximate conversion
-        # Add tolerance to beam size
-        beam_width_deg = (beam_width_km + beam_width_km*0.4) * deg_per_km
-        beam_height_deg = (beam_height_km + beam_height_km*0.4) * deg_per_km
-
-        sat_lat = math.degrees(self.latitude)
-        sat_lon = math.degrees(self.longitude)
 
         if self.constellationType =="OneWeb":  
+            # OneWeb: coverage area is a square, divided into 16 horizontal strips (vertically stacked)
+            total_area_km2 = 1_718_000
+            side_km = total_area_km2 ** 0.5  # ≈ 1310 km
+            n_beams = 16
+            beam_width_km = side_km
+            beam_height_km = side_km / n_beams  # ≈ 81.9 km
+
+            deg_per_km = 1 / 111  # Approximate conversion
+            # Add tolerance to beam size
+            beam_width_deg = (beam_width_km + beam_width_km*0.4) * deg_per_km
+            beam_height_deg = (beam_height_km + beam_height_km*0.4) * deg_per_km
+
+            sat_lat = math.degrees(self.latitude)
+            sat_lon = math.degrees(self.longitude)
 
             # The top edge of the coverage square
             top_lat = sat_lat + (side_km / 2) * deg_per_km
@@ -841,19 +844,10 @@ class Aircraft:
             self.speed_kmph = 0
             self.height = height  # in meters
 
-        self.connected_satellite = None
-        self.connected_beam = None
-        self.current_snr = 0
-        self.current_latency = 0
-        self.handover_count = 0
+        self.links = {}
         self.min_dwell_s = 5.0
         self.time_to_trigger_s = 5.0
         self.handover_rng = handover_rng or random.Random()
-        self.last_handover_time = -float("inf")
-        self.ttt_candidate = None
-        self.ttt_candidate_sat = None
-        self.ttt_start_time = None
-        self.service_drop_until = 0.0
         # Latency model terms (RTT-level additions): fixed processing + stochastic jitter
         self.fixed_processing_latency_s = 0.030
         self.jitter_std_s = 0.005
@@ -885,12 +879,63 @@ class Aircraft:
         self.steering_action_indices = None  # Preferred interface: length-M list with candidate-slot indices
         self.current_steering_candidates = []
         self.current_passenger_order = []
+        self.log_active_links = True
 
         print(f"Aircraft {self.id} initialized at ({self.latitude:.2f}, {self.longitude:.2f})")
 
     def __repr__(self):
         return 'Aircraft ID: {}, Latitude: {}, Longitude: {}, Altitude: {}'.format(
             self.id, self.latitude, self.longitude, self.height)
+
+    @staticmethod
+    def _constellation_key_from_sat(sat):
+        return getattr(sat, "constellation_name", None) or getattr(sat, "constellationType", "Unknown")
+
+    def _new_link_state(self):
+        return {
+            "connected_satellite": None,
+            "connected_beam": None,
+            "current_snr": -100.0,
+            "current_latency": 0.0,
+            "handover_count": 0,
+            "last_handover_time": -float("inf"),
+            "ttt_candidate": None,
+            "ttt_candidate_sat": None,
+            "ttt_start_time": None,
+            "service_drop_until": 0.0,
+        }
+
+    def _ensure_link_state(self, key):
+        if key not in self.links:
+            self.links[key] = self._new_link_state()
+        return self.links[key]
+
+    def _get_primary_link_key(self):
+        for preferred in ("OneWeb", "Intelsat"):
+            st = self.links.get(preferred)
+            if st and st["connected_beam"] is not None:
+                return preferred
+        best_key = None
+        best_snr = -float("inf")
+        for key, st in self.links.items():
+            if st["connected_beam"] is None:
+                continue
+            if st["current_snr"] > best_snr:
+                best_snr = st["current_snr"]
+                best_key = key
+        return best_key
+
+    def _get_primary_link_state(self):
+        key = self._get_primary_link_key()
+        if key is None:
+            return None
+        return self.links.get(key)
+
+    def _iter_connected_link_states(self):
+        for ckey, st in self.links.items():
+            if st.get("connected_satellite") is None or st.get("connected_beam") is None:
+                continue
+            yield ckey, st
 
     def _get_rx_gain_dbi(self, sat=None):
         if sat is not None and getattr(sat, "constellationType", "") == "Intelsat":
@@ -1102,6 +1147,35 @@ class Aircraft:
         propagation_rtt_s = 2.0 * ((aircraft_to_sat_m + sat_to_gateway_m) / Vc)
         return propagation_rtt_s + self.fixed_processing_latency_s
 
+    def _get_active_link_candidates(self):
+        """
+        Build steering candidates from currently connected links only
+        (at most one per constellation with current handover logic).
+        """
+        active = []
+        for _ckey, st in self.links.items():
+            sat = st.get("connected_satellite")
+            beam = st.get("connected_beam")
+            if sat is None or beam is None:
+                continue
+            dist_km = self._calculate_3d_distance(sat) / 1000.0
+            snr = self.calculate_snr(beam, dist_km, sat=sat)
+            st["current_snr"] = snr
+            st["current_latency"] = self._calculate_latency(sat)
+            active.append(
+                {
+                    "sat": sat,
+                    "beam": beam,
+                    "snr": snr,
+                    "distance_km": dist_km,
+                    "load": beam.load,
+                    "capacity": beam.capacity,
+                    "beam_id": beam.id,
+                    "sat_id": sat.ID,
+                }
+            )
+        return sorted(active, key=lambda c: c.get("snr", -1e9), reverse=True)
+
     def _steer_passenger_traffic(self, deltaT):
         """
         Greedy per-step traffic steering:
@@ -1129,7 +1203,27 @@ class Aircraft:
                 "avg_latency_s": 0.0,
             }
 
-        if not self.latest_candidates:
+        active_candidates = self._get_active_link_candidates()
+        # Sanity check: steering candidates must be at most one connected beam per constellation.
+        seen_constellations = set()
+        for cand in active_candidates:
+            ckey = self._constellation_key_from_sat(cand["sat"])
+            if ckey in seen_constellations:
+                raise AssertionError(
+                    f"Steering received multiple active beams for constellation '{ckey}' in one timestep."
+                )
+            seen_constellations.add(ckey)
+        if self.log_active_links:
+            sim_time = self.env.now if hasattr(self.env, "now") else self.time
+            if active_candidates:
+                active_desc = ", ".join(
+                    f"{self._constellation_key_from_sat(c['sat'])}:{c['sat_id']}::{c['beam_id']} SNR={c['snr']:.2f}dB"
+                    for c in active_candidates
+                )
+            else:
+                active_desc = "none"
+            print(f"[Steering] t={sim_time:.2f}s active_links={active_desc}")
+        if not active_candidates:
             total_demand_mbps = sum(d["demand_mbps"] for d in demands)
             service_drop = deltaT
             self.last_steering_assignments = []
@@ -1151,12 +1245,8 @@ class Aircraft:
                 "avg_latency_s": 0.0,
             }
 
-        # Build a fixed-size candidate set across both networks (LEO + GEO).
-        ranked_candidates = sorted(
-            self.latest_candidates,
-            key=lambda c: c.get("snr", -1e9),
-            reverse=True,
-        )[: self.max_steer_candidates]
+        # Build candidate set from active links only (post-handover state).
+        ranked_candidates = active_candidates[: self.max_steer_candidates]
         self.current_steering_candidates = ranked_candidates
         ordered_demands = sorted(demands, key=lambda x: (x["latency_req_s"], -x["demand_mbps"]))[: self.max_steer_apps]
         self.current_passenger_order = [d["passenger_id"] for d in ordered_demands]
@@ -1400,11 +1490,7 @@ class Aircraft:
             [d for d in self.passenger_step_cache if d["demand_mbps"] > 1e-9],
             key=lambda x: (x["latency_req_s"], -x["demand_mbps"]),
         )[: self.max_steer_apps]
-        ranked_candidates = sorted(
-            self.latest_candidates,
-            key=lambda c: c.get("snr", -1e9),
-            reverse=True,
-        )[: self.max_steer_candidates]
+        ranked_candidates = self._get_active_link_candidates()[: self.max_steer_candidates]
         self.current_passenger_order = [d["passenger_id"] for d in ordered_demands]
         self.current_steering_candidates = ranked_candidates
 
@@ -1455,15 +1541,18 @@ class Aircraft:
         
         Args:
             data_size_mb: Size of the data to be transmitted in megabytes  """ 
-        if self.connected_beam is None: 
+        primary = self._get_primary_link_state()
+        if primary is None:
             return 1000, 0   # No connection means infinite delay
-        
-        if self.connected_beam.load >= 1.0:
+        beam = primary["connected_beam"]
+        snr_db = primary["current_snr"]
+
+        if beam.load >= 1.0:
             return 1000, 0   # Infinite delay if load is at or above capacity
-        
-        shannon_capacity = self.connected_beam.effective_bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
+
+        shannon_capacity = beam.effective_bw * math.log2(1 + 10**(snr_db/10)) / 1e6  # in Mbps
         demand_mbps = (self.demand * 8) / max(deltaT, 1e-9)
-        transmission_rate_mbps = min(shannon_capacity, self.connected_beam.max_ds_speed, demand_mbps)
+        transmission_rate_mbps = min(shannon_capacity, beam.max_ds_speed, demand_mbps)
         
         if transmission_rate_mbps <= 0.0:
             return 1000, 0.0
@@ -1499,24 +1588,28 @@ class Aircraft:
             return ratio, allocated, demand, beam_capacity_MB
 
         # Get available capacity from the current beam (in Gbps, convert to MB for deltaT)
-        if self.connected_beam:
-            if self.connected_beam.load >= 1.0:
+        primary = self._get_primary_link_state()
+        if primary is not None:
+            beam = primary["connected_beam"]
+            snr_db = primary["current_snr"]
+            if beam.load >= 1.0:
                 allocated = 0.0
-                beam_capacity_MB = self.connected_beam.max_capacity * 125 * deltaT  # MB for reporting
+                beam_capacity_MB = beam.max_capacity * 125 * deltaT  # MB for reporting
                 shannon_capacity = 0.0
             else:
             # Convert beam capacity from Gbps to MB for this timestep
             # 1 Gbps = 125 MB/s
-                beam_capacity_MB = self.connected_beam.max_capacity * 125 * deltaT  # MB for this timestep (for reporting)
-                shannon_capacity = self.connected_beam.effective_bw * math.log2(1 + 10**(self.current_snr/10)) / 1e6  # in Mbps
+                beam_capacity_MB = beam.max_capacity * 125 * deltaT  # MB for this timestep (for reporting)
+                shannon_capacity = beam.effective_bw * math.log2(1 + 10**(snr_db/10)) / 1e6  # in Mbps
         else:
             beam_capacity_MB = 0
             shannon_capacity = 0 
 
         # Allocated bandwidth is bounded by shannon capacity, demand, and max DS speed.
-        if self.connected_beam and self.connected_beam.load < 1.0: 
+        if primary is not None and primary["connected_beam"].load < 1.0:
+            beam = primary["connected_beam"]
             demand_mbps = (self.demand * 8) / max(deltaT, 1e-9)
-            served_mbps = min(shannon_capacity, self.connected_beam.max_ds_speed, demand_mbps)
+            served_mbps = min(shannon_capacity, beam.max_ds_speed, demand_mbps)
             allocated = (served_mbps * deltaT) / 8
         else: 
             allocated = 0 
@@ -1545,19 +1638,30 @@ class Aircraft:
             total_throughput_required = self.last_throughput_req_mbps
         else:
             queing_delay, transmission_rate_mbps = self.queing_delay(total_throughput_required, deltaT)
+        primary = self._get_primary_link_state()
+        if primary is not None:
+            primary_sat = primary["connected_satellite"]
+            primary_snr = primary["current_snr"]
+            primary_last_handover = primary["last_handover_time"]
+            primary_ttt_start = primary["ttt_start_time"]
+        else:
+            primary_sat = None
+            primary_snr = -100.0
+            primary_last_handover = -float("inf")
+            primary_ttt_start = None
         # RTT latency = propagation RTT + fixed processing + stochastic jitter
         jitter_s = abs(self.handover_rng.gauss(0.0, self.jitter_std_s))
-        propagation_latency = self._calculate_latency() * 2 + self.fixed_processing_latency_s + jitter_s
+        propagation_latency = self._calculate_latency(primary_sat) * 2 + self.fixed_processing_latency_s + jitter_s
         sim_time = self.env.now if hasattr(self.env, "now") else self.time
         if self.traffic_steering_enabled:
             service_drop_s = self.last_service_drop_s
         else:
             service_drop_s = deltaT if demand > 0 and allocated <= 0 else 0.0
-        dwell_remaining_s = max(0.0, self.min_dwell_s - (sim_time - self.last_handover_time))
-        if self.ttt_start_time is None:
+        dwell_remaining_s = max(0.0, self.min_dwell_s - (sim_time - primary_last_handover))
+        if primary_ttt_start is None:
             ttt_remaining_s = 0.0
         else:
-            ttt_remaining_s = max(0.0, self.time_to_trigger_s - (sim_time - self.ttt_start_time))
+            ttt_remaining_s = max(0.0, self.time_to_trigger_s - (sim_time - primary_ttt_start))
         return {
             'allocation_ratio': ratio,
             'allocated_bandwidth_MB': allocated,
@@ -1568,7 +1672,7 @@ class Aircraft:
             'propagation_latency_s': propagation_latency, 
             'throughput_req_mbps': total_throughput_required, 
             'latency_req_s': max_latency_allowed/1000, # convert ms to s 
-            'SNR_dB': self.current_snr,
+            'SNR_dB': primary_snr,
             'service_drop_s': service_drop_s,
             'latency_violation_rate': self.last_latency_violation_rate if self.traffic_steering_enabled else 0.0,
             'avg_assigned_latency_s': self.last_avg_latency_s if self.traffic_steering_enabled else propagation_latency,
@@ -1622,75 +1726,82 @@ class Aircraft:
         # 2. Find the best beam using the efficient KDTree scan
         candidates = self.scan_nearby_fast(constellation)  
         self.latest_candidates = candidates
-        if not candidates:
-            if self.connected_beam:
-                print(f"Time {sim_time:.2f}: Aircraft {self.id} LOST connection from {self.connected_beam.id}")
-            self.connected_beam = None
-            self.connected_satellite = None
-            self.current_snr = -100
-            self.current_latency = 0
-            self.ttt_candidate = None
-            self.ttt_candidate_sat = None
-            self.ttt_start_time = None
-            self.latest_candidates = []
-            return deltaT
+        by_constellation = {}
+        for cand in candidates:
+            ckey = self._constellation_key_from_sat(cand["sat"])
+            by_constellation.setdefault(ckey, []).append(cand)
 
-        best = max(candidates, key=lambda c: c["snr"])
-        best_candidate_sat = best["sat"]
-        best_candidate_beam = best["beam"]
-        best_snr = best["snr"]
+        all_constellation_keys = set(self.links.keys()) | set(by_constellation.keys())
+        for ckey in all_constellation_keys:
+            st = self._ensure_link_state(ckey)
+            cands = by_constellation.get(ckey, [])
+            if not cands:
+                if st["connected_beam"] is not None:
+                    print(
+                        f"Time {sim_time:.2f}: Aircraft {self.id} LOST connection from {st['connected_beam'].id} ({ckey})"
+                    )
+                self.links[ckey] = self._new_link_state()
+                continue
 
-        if self.connected_beam is None:
-            print(f"Time {sim_time:.2f}: Aircraft {self.id} CONNECTED to {best_candidate_beam.id} (Initial connection)")
-            self.connected_beam = best_candidate_beam
-            self.connected_satellite = best_candidate_sat
-            self.current_snr = best_snr
-            self.current_latency = self._calculate_latency()
-            self.last_handover_time = sim_time
-            return deltaT
+            best = max(cands, key=lambda c: c["snr"])
+            best_candidate_sat = best["sat"]
+            best_candidate_beam = best["beam"]
+            best_snr = best["snr"]
 
-        if best_candidate_beam == self.connected_beam:
-            self.current_snr = best_snr
-            self.current_latency = self._calculate_latency()
-            self.ttt_candidate = None
-            self.ttt_candidate_sat = None
-            self.ttt_start_time = None
-            return deltaT
+            if st["connected_beam"] is None:
+                print(
+                    f"Time {sim_time:.2f}: Aircraft {self.id} CONNECTED to {best_candidate_beam.id} (Initial connection, {ckey})"
+                )
+                st["connected_beam"] = best_candidate_beam
+                st["connected_satellite"] = best_candidate_sat
+                st["current_snr"] = best_snr
+                st["current_latency"] = self._calculate_latency(best_candidate_sat)
+                st["last_handover_time"] = sim_time
+                continue
 
-        current_snr_now = self.calculate_snr(
-            self.connected_beam,
-            self._calculate_3d_distance(self.connected_satellite) / 1000,
-            sat=self.connected_satellite,
-        )
-        self.current_snr = current_snr_now
-        self.current_latency = self._calculate_latency()
+            if best_candidate_beam == st["connected_beam"]:
+                st["current_snr"] = best_snr
+                st["current_latency"] = self._calculate_latency(st["connected_satellite"])
+                st["ttt_candidate"] = None
+                st["ttt_candidate_sat"] = None
+                st["ttt_start_time"] = None
+                continue
 
-        if sim_time - self.last_handover_time < self.min_dwell_s:
-            return deltaT
+            current_snr_now = self.calculate_snr(
+                st["connected_beam"],
+                self._calculate_3d_distance(st["connected_satellite"]) / 1000,
+                sat=st["connected_satellite"],
+            )
+            st["current_snr"] = current_snr_now
+            st["current_latency"] = self._calculate_latency(st["connected_satellite"])
 
-        if self.ttt_candidate != best_candidate_beam:
-            self.ttt_candidate = best_candidate_beam
-            self.ttt_candidate_sat = best_candidate_sat
-            self.ttt_start_time = sim_time
-            return deltaT
+            if sim_time - st["last_handover_time"] < self.min_dwell_s:
+                continue
 
-        if sim_time - self.ttt_start_time < self.time_to_trigger_s:
-            return deltaT
+            if st["ttt_candidate"] != best_candidate_beam:
+                st["ttt_candidate"] = best_candidate_beam
+                st["ttt_candidate_sat"] = best_candidate_sat
+                st["ttt_start_time"] = sim_time
+                continue
 
-        self.handover_count += 1
-        print(f"Time {sim_time:.2f}: Aircraft {self.id} HANDOVER from {self.connected_beam.id} to {best_candidate_beam.id}. Handovers: {self.handover_count}")
-        sat_changed = self.connected_satellite is not None and best_candidate_sat != self.connected_satellite
-        self.connected_beam = best_candidate_beam
-        self.connected_satellite = best_candidate_sat
-        self.current_snr = best_snr
-        self.current_latency = self._calculate_latency()
-        self.last_handover_time = sim_time
-        self.service_drop_until = sim_time
-        self.ttt_candidate = None
-        self.ttt_candidate_sat = None
-        self.ttt_start_time = None
+            if sim_time - st["ttt_start_time"] < self.time_to_trigger_s:
+                continue
 
-        return deltaT 
+            st["handover_count"] += 1
+            print(
+                f"Time {sim_time:.2f}: Aircraft {self.id} HANDOVER from {st['connected_beam'].id} to {best_candidate_beam.id} ({ckey}). Handovers: {st['handover_count']}"
+            )
+            st["connected_beam"] = best_candidate_beam
+            st["connected_satellite"] = best_candidate_sat
+            st["current_snr"] = best_snr
+            st["current_latency"] = self._calculate_latency(best_candidate_sat)
+            st["last_handover_time"] = sim_time
+            st["service_drop_until"] = sim_time
+            st["ttt_candidate"] = None
+            st["ttt_candidate_sat"] = None
+            st["ttt_start_time"] = None
+
+        return deltaT
 
     def _calculate_3d_distance(self, satellite):
         """Calculates the 3D slant range from aircraft to satellite."""
@@ -1716,13 +1827,17 @@ class Aircraft:
         total_distance_m = math.sqrt((dist_2d_km * 1000)**2 + (altitude_diff_m)**2)
         return total_distance_m
 
-    def _calculate_latency(self):
+    def _calculate_latency(self, satellite=None):
         """
         Calculates the propagation latency from the aircraft to the gateway via satellite.
         """
-        if self.connected_satellite:
-            aircraft_to_sat_m = self._calculate_3d_distance(self.connected_satellite)
-            sat_to_gateway_m = self._calculate_3d_distance_to_gateway(self.connected_satellite)
+        sat = satellite
+        if sat is None:
+            primary = self._get_primary_link_state()
+            sat = primary["connected_satellite"] if primary is not None else None
+        if sat:
+            aircraft_to_sat_m = self._calculate_3d_distance(sat)
+            sat_to_gateway_m = self._calculate_3d_distance_to_gateway(sat)
             propagation_delay = (aircraft_to_sat_m + sat_to_gateway_m) / Vc
             return propagation_delay
         return 0           
@@ -2066,10 +2181,11 @@ class Earth:
             # Optionally plot aircraft connection lines
             plotted_conn_label = False
             for aircraft in aircrafts:
-                if aircraft.connected_satellite:
+                for ckey, st in aircraft._iter_connected_link_states():
+                    sat = st["connected_satellite"]
                     # Convert to degrees for plotting
-                    line_lons = [aircraft.longitude, math.degrees(aircraft.connected_satellite.longitude)]
-                    line_lats = [aircraft.latitude, math.degrees(aircraft.connected_satellite.latitude)]
+                    line_lons = [aircraft.longitude, math.degrees(sat.longitude)]
+                    line_lats = [aircraft.latitude, math.degrees(sat.latitude)]
                     if not plotted_conn_label:
                         ax.plot(line_lons, line_lats, color='green', linewidth=1.0, linestyle='--', transform=ccrs.Geodetic(), label='Connection', zorder=15)
                         plotted_conn_label = True
@@ -2080,7 +2196,7 @@ class Earth:
             for i, aircraft in enumerate(aircrafts):
                 # Calculate metrics
                 avg_allocation = sum(aircraft.allocation_ratios) / len(aircraft.allocation_ratios) if aircraft.allocation_ratios else 0
-                total_handovers = aircraft.handover_count
+                total_handovers = sum(st["handover_count"] for st in aircraft.links.values())
                 total_data = aircraft.total_allocated_bandwidth
                 total_demand = aircraft.total_demand
 
@@ -2108,7 +2224,7 @@ class Earth:
         if aircrafts:
             # Calculate aggregate statistics
             total_aircraft = len(aircrafts)
-            total_handovers_all = sum(ac.handover_count for ac in aircrafts)
+            total_handovers_all = sum(sum(st["handover_count"] for st in ac.links.values()) for ac in aircrafts)
             total_data_all = sum(ac.total_allocated_bandwidth for ac in aircrafts)
             total_demand_all = sum(ac.total_demand for ac in aircrafts)
 
@@ -2164,7 +2280,11 @@ class Earth:
             os.makedirs("simulationImages")
         print(f"\nSaving plot {self.img_count} at simulation time {env.now}")
         # Get the ID of the connected beam for highlighting
-        selected_beam_id = aircrafts[0].connected_beam.id if aircrafts and aircrafts[0].connected_beam else None
+        selected_beam_id = None
+        if aircrafts:
+            primary = aircrafts[0]._get_primary_link_state()
+            if primary is not None and primary["connected_beam"] is not None:
+                selected_beam_id = primary["connected_beam"].id
         self.plotMap(plotSat=plotSat, plotBeams=plotBeams, plotAircrafts=plotAircrafts, aircrafts=aircrafts, selected_beam_id=selected_beam_id)
         plt.savefig(f"simulationImages/{folder}/sat_positions_{self.img_count}.png")
         plt.close()
@@ -2370,132 +2490,6 @@ def create_Constellation(specific_constellation, env):
     return orbital_planes
 
 
-class MultiOrbitSteeringEnv:
-    """
-    Lightweight RL wrapper for masked traffic-steering actions.
-    Action: length-M vector of candidate indices (one per app slot).
-    Observation: dict from Aircraft.get_steering_observation().
-    """
-    def __init__(
-        self,
-        route,
-        constellation="OneWeb+Intelsat",
-        scenario=None,
-        aircraft_constellations=None,
-        demand_seed=42,
-        handover_seed=123,
-        base_seed=1,
-        reward_weights=None,
-    ):
-        self.route = route
-        self.constellation = constellation
-        self.scenario = scenario
-        self.aircraft_constellations = aircraft_constellations
-        self.demand_seed = demand_seed
-        self.handover_seed = handover_seed
-        self.base_seed = base_seed
-        self.episode = 0
-
-        self.reward_weights = reward_weights or {
-            "alloc": 1.0,
-            "drop": 0.8,
-            "lat": 0.6,
-        }
-
-        self.env = None
-        self.earth = None
-        self.aircraft = None
-        self.last_obs = None
-        self.step_idx = 0
-        self.max_steps = max(1, len(route) - 1) if route else 1
-
-    def _seed_all(self, seed):
-        random.seed(seed)
-        np.random.seed(seed)
-
-    @staticmethod
-    def _sanitize_action_with_mask(action_indices, action_mask):
-        if action_mask is None:
-            return action_indices
-        mask = np.asarray(action_mask)
-        m, k = mask.shape
-        out = [0] * m
-        for i in range(m):
-            valid = np.where(mask[i] > 0.5)[0]
-            if len(valid) == 0:
-                out[i] = 0
-                continue
-            a = 0
-            if isinstance(action_indices, (list, tuple, np.ndarray)) and i < len(action_indices):
-                ai = action_indices[i]
-                if isinstance(ai, (int, np.integer)):
-                    a = int(ai)
-            if a < 0 or a >= k or mask[i, a] <= 0.5:
-                out[i] = int(valid[0])
-            else:
-                out[i] = a
-        return out
-
-    def _build_reward(self, qoe):
-        alloc_ratio = float(qoe.get("allocation_ratio", 0.0))
-        delta_t = max(1e-9, float(self.earth.deltaT if self.earth else 1.0))
-        drop_norm = float(qoe.get("service_drop_s", 0.0)) / delta_t
-        lat_violation = float(qoe.get("latency_violation_rate", 0.0))
-        w = self.reward_weights
-        reward = (
-            w["alloc"] * alloc_ratio
-            - w["drop"] * drop_norm
-            - w["lat"] * lat_violation
-        )
-        return float(np.clip(reward, -1.0, 1.0))
-
-    def reset(self, seed=None):
-        if seed is None:
-            seed = self.base_seed + self.episode
-        self._seed_all(seed)
-        self.episode += 1
-        self.step_idx = 0
-
-        self.env = simpy.Environment()
-        self.earth = initialize(
-            self.env,
-            self.constellation,
-            self.route,
-            scenario=self.scenario,
-            demand_seed=self.demand_seed + seed,
-            handover_seed=self.handover_seed + seed,
-            aircraft_constellations=self.aircraft_constellations,
-        )
-        self.aircraft = self.earth.aircraft[0]
-        # Prime one decision state with no external action.
-        qoe_list = self.earth.step_aircraft(actions=None)
-        qoe = qoe_list[0] if qoe_list else {}
-        self.last_obs = self.aircraft.get_steering_observation()
-        info = {"qoe": qoe, "seed": seed}
-        return self.last_obs, info
-
-    def step(self, action):
-        if self.earth is None:
-            raise RuntimeError("Call reset() before step().")
-
-        current_mask = self.last_obs.get("action_mask") if isinstance(self.last_obs, dict) else None
-        safe_action = self._sanitize_action_with_mask(action, current_mask)
-        qoe_list = self.earth.step_aircraft(actions=safe_action)
-        qoe = qoe_list[0] if qoe_list else {}
-
-        # Advance simpy time for deterministic timer progression.
-        dt = max(1.0, float(self.earth.deltaT if self.earth else 1.0))
-        self.env.run(until=self.env.now + dt)
-
-        reward = self._build_reward(qoe)
-        self.last_obs = self.aircraft.get_steering_observation()
-        self.step_idx += 1
-        done = self.step_idx >= self.max_steps
-        truncated = False
-        info = {"qoe": qoe}
-        return self.last_obs, reward, done, truncated, info
-
-
 # Global variable to store the earth instance, so Aircraft class can access it
 earth_instance = None
 
@@ -2539,13 +2533,16 @@ def main():
     for aircraft in all_aircrafts:
         print("\n\n--- Simulation Summary ---")
         print(f"Total simulation run time: {timeToSim:.2f} seconds")
-        print(f"Aircraft '{aircraft.id}' total handovers: {aircraft.handover_count}")
-        if aircraft.connected_beam:
-            print(f"Aircraft '{aircraft.id}' final connected beam: {aircraft.connected_beam.id}")
-            print(f"Aircraft '{aircraft.id}' final SNR: {aircraft.current_snr:.2f} dB")
+        total_handovers = sum(st["handover_count"] for st in aircraft.links.values())
+        print(f"Aircraft '{aircraft.id}' total handovers: {total_handovers}")
+        connected_states = list(aircraft._iter_connected_link_states())
+        if connected_states:
+            for ckey, st in connected_states:
+                print(f"Aircraft '{aircraft.id}' final connected beam ({ckey}): {st['connected_beam'].id}")
+                print(f"Aircraft '{aircraft.id}' final SNR ({ckey}): {st['current_snr']:.2f} dB")
+                print(f"Aircraft '{aircraft.id}' final Latency ({ckey}): {st['current_latency']*1e3:.2f} ms")
             print(f"Aircraft '{aircraft.id}' total allocated BW: {aircraft.total_allocated_bandwidth:.2f} MB")
             print(f"Aircraft '{aircraft.id}' Average Allocation to demand: {sum(aircraft.allocation_ratios)/len(aircraft.allocation_ratios):.2f}")
-            print(f"Aircraft '{aircraft.id}' final Latency: {aircraft.current_latency*1e3:.2f} ms")
         else:
             print(f"Aircraft '{aircraft.id}' ended the simulation with no connection.")
 

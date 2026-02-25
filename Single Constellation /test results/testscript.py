@@ -6,7 +6,9 @@ import numpy as np
 import simpy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR) == "test results" else SCRIPT_DIR
+PROJECT_DIR = SCRIPT_DIR
+if not os.path.isdir(os.path.join(PROJECT_DIR, "Environment")):
+    PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
@@ -49,19 +51,26 @@ def _ensure_dirs(base_dir_path):
 
 
 def _resolve_file(base_dir_path, filename, folder_name=None):
+    candidates = []
     if folder_name is not None:
-        candidate = os.path.join(base_dir_path, folder_name, filename)
+        candidates.append(os.path.join(base_dir_path, folder_name, filename))
+    candidates.append(os.path.join(base_dir_path, filename))
+    if not filename.endswith(".zip"):
+        if folder_name is not None:
+            candidates.append(os.path.join(base_dir_path, folder_name, f"{filename}.zip"))
+        candidates.append(os.path.join(base_dir_path, f"{filename}.zip"))
+    for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
-    direct = os.path.join(base_dir_path, filename)
-    return direct
+    return candidates[-1]
 
 # ==============================================
 # MODEL SELECTION - Choose which model to test
 # ==============================================
 # Options: 'ODT', 'DQN', 'PPO', 'BASELINE', 'ODT_FINETUNED', 'ORACLE', 'ORACLE_LATENCY', 'ORACLE_DROP', 'BASELINE_LEGACY'
-SELECTED_MODEL = 'ODT'  # Default: ODT
-EVAL_SEED = 42
+SELECTED_MODEL = os.getenv("SELECTED_MODEL", "ODT")  # Default: ODT
+EVAL_SEED = int(os.getenv("EVAL_SEED", "42"))
+RESULTS_TAG = os.getenv("RESULTS_TAG", "").strip()
 
 def append_observation_to_file(obs, step, model_name, filename):
     """Append single observation to file"""
@@ -101,13 +110,18 @@ if not os.path.exists(route_path):
 route, route_duration = load_route_from_csv(route_path, skip_rows=0)
 
 SCENARIOS = [
-    "load_cycle_1",
-    "load_cycle_2",
-    "load_cycle_5",
-    "medium_aircraft",
-    "large_aircraft",
-    "snr_congested",
+    "load_cycle_1"
+    #"load_cycle_2",
+    #"load_cycle_5",
+    #"medium_aircraft",
+    #"large_aircraft",
+    #"snr_congested",
 ]
+scenarios_env = os.getenv("SCENARIOS")
+if scenarios_env:
+    parsed = [s.strip() for s in scenarios_env.split(",") if s.strip()]
+    if parsed:
+        SCENARIOS = parsed
 ODT_MODELS = [
     #("ODT", "decision_transformer_offline_best.pth"),
     ("ODT_FINETUNED", "decision_transformer_online_finetune_best_20.pth"),
@@ -148,7 +162,7 @@ def predict_valid_action_oracle(base_env, obs, mask):
     if not np.any(mask):
         return -1
 
-    candidates = base_env.current_beam_candidates
+    candidates = getattr(base_env.aircraft, "current_steering_candidates", [])
     ac = base_env.aircraft
     qoe = base_env.last_qoe if getattr(base_env, "last_qoe", None) is not None else base_env._refresh_qoe_cache()
 
@@ -164,7 +178,7 @@ def predict_valid_action_oracle(base_env, obs, mask):
     best_reward = -float("inf")
 
     for i, cand in enumerate(candidates):
-        if i >= len(mask) or not mask[i] or cand is None:
+        if i >= len(mask) or i >= len(candidates) or not mask[i] or cand is None:
             continue
 
         beam = cand["beam"]
@@ -263,12 +277,12 @@ def _oracle_candidate_metrics(base_env, cand):
 def predict_valid_action_oracle_latency(base_env, obs, mask):
     if not np.any(mask):
         return -1
-    candidates = base_env.current_beam_candidates
+    candidates = getattr(base_env.aircraft, "current_steering_candidates", [])
     best_action = -1
     best_latency = float("inf")
     best_drop = float("inf")
     for i, cand in enumerate(candidates):
-        if i >= len(mask) or not mask[i] or cand is None:
+        if i >= len(mask) or i >= len(candidates) or not mask[i] or cand is None:
             continue
         m = _oracle_candidate_metrics(base_env, cand)
         if (m["total_latency_s"] < best_latency) or (
@@ -283,11 +297,11 @@ def predict_valid_action_oracle_latency(base_env, obs, mask):
 def predict_valid_action_oracle_drop(base_env, obs, mask):
     if not np.any(mask):
         return -1
-    candidates = base_env.current_beam_candidates
+    candidates = getattr(base_env.aircraft, "current_steering_candidates", [])
     best_action = -1
     best_key = None
     for i, cand in enumerate(candidates):
-        if i >= len(mask) or not mask[i] or cand is None:
+        if i >= len(mask) or i >= len(candidates) or not mask[i] or cand is None:
             continue
         m = _oracle_candidate_metrics(base_env, cand)
         key = (
@@ -311,11 +325,11 @@ def predict_valid_action_baseline_rl(agent, obs, mask, base_env=None):
         # Fallback: first valid
         return int(np.where(mask)[0][0])
 
-    candidates = base_env.current_beam_candidates
+    candidates = getattr(base_env.aircraft, "current_steering_candidates", [])
     best_idx = -1
     best_snr = -float("inf")
     for i, cand in enumerate(candidates):
-        if i >= len(mask) or not mask[i] or cand is None:
+        if i >= len(mask) or i >= len(candidates) or not mask[i] or cand is None:
             continue
         snr = float(cand.get("snr", -1e9))
         if snr > best_snr:
@@ -325,12 +339,12 @@ def predict_valid_action_baseline_rl(agent, obs, mask, base_env=None):
 
 for scenario in SCENARIOS:
     scenario_suffix = scenario
+    tag_suffix = f"_{RESULTS_TAG}" if RESULTS_TAG else ""
     if SELECTED_MODEL == 'PPO':
         print("Loading PPO Agent...")
         env = LEOEnvPPO(constellation_name, route, scenario=scenario)
         env = ActionMasker(env, mask_fn)
-        agent = MaskablePPO("MlpPolicy", env, verbose=0)
-        agent.load(_resolve_file(base_dir, "handover_ppo_agent", MODELS_DIRNAME))
+        agent = MaskablePPO.load(_resolve_file(base_dir, "handover_ppo_agent", MODELS_DIRNAME), env=env)
         env.env.earth.Training = False
         predict_fn = predict_valid_action
         
@@ -338,8 +352,7 @@ for scenario in SCENARIOS:
         print("Loading DQN Agent...")
         env = LEOEnvDQN(constellation_name, route, scenario=scenario)
         env = ActionMasker(env, mask_fn)
-        agent = DQN("MlpPolicy", env, verbose=0, buffer_size=50)
-        agent.load(_resolve_file(base_dir, "handover_dqn_agent", MODELS_DIRNAME))
+        agent = DQN.load(_resolve_file(base_dir, "handover_dqn_agent", MODELS_DIRNAME), env=env)
         env.env.earth.Training = False
         predict_fn = predict_valid_action_dqn
 
@@ -397,11 +410,14 @@ for scenario in SCENARIOS:
     def run_evaluation(model_label, env, agent, predict_fn, odt_state_dim=None, odt_action_dim=None):
         done = False
         step_count = 0
-        results_filename = os.path.join(test_results_dir, f"{model_label}_observations_{scenario_suffix}.csv")
+        results_filename = os.path.join(
+            test_results_dir,
+            f"{model_label}_observations_{scenario_suffix}{tag_suffix}.csv",
+        )
         if os.path.exists(results_filename):
             os.remove(results_filename)
 
-        obs, info = env.reset()
+        obs, info = env.reset(seed=EVAL_SEED)
 
         print(f"Starting evaluation for {model_label} model (scenario: {scenario_suffix})...")
         print(f"Full route duration: {route_duration} steps")
@@ -451,7 +467,13 @@ for scenario in SCENARIOS:
             'observations_file': results_filename
         }
 
-        with open(os.path.join(test_results_dir, f"{model_label}_summary_{scenario_suffix}.pkl"), 'wb') as f:
+        with open(
+            os.path.join(
+                test_results_dir,
+                f"{model_label}_summary_{scenario_suffix}{tag_suffix}.pkl",
+            ),
+            'wb',
+        ) as f:
             pickle.dump(final_results, f)
 
         print("All results saved successfully!")

@@ -36,6 +36,8 @@ class LEOEnv(gym.Env):
 
     def __init__(self, constellation_name, route, scenario=None):
         super(LEOEnv, self).__init__()
+        self.base_seed = int(os.getenv("EVAL_SEED", "42"))
+        self.current_seed = self.base_seed
 
         # We'll set a placeholder action space, but update it dynamically
         self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
@@ -62,15 +64,22 @@ class LEOEnv(gym.Env):
         self.action_mask = None
         self.last_qoe = None
 
-        np.random.seed(42)
-        random.seed(42)
+        np.random.seed(self.current_seed)
+        random.seed(self.current_seed)
 
-        self._setup_simulation()
+        self._setup_simulation(self.current_seed)
 
-    def _setup_simulation(self):
+    def _setup_simulation(self, seed):
 
         self.env = simpy.Environment()
-        self.earth = initialize(self.env, self.constellation, self.route, scenario=self.scenario)
+        self.earth = initialize(
+            self.env,
+            self.constellation,
+            self.route,
+            scenario=self.scenario,
+            demand_seed=int(seed),
+            handover_seed=int(seed) + 1000,
+        )
         self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
         self.current_step = 0
 
@@ -102,9 +111,10 @@ class LEOEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        np.random.seed(42)
-        random.seed(42)
-        self._setup_simulation()
+        self.current_seed = self.base_seed if seed is None else int(seed)
+        np.random.seed(self.current_seed)
+        random.seed(self.current_seed)
+        self._setup_simulation(self.current_seed)
         self.action_mask = self._get_action_mask()  # Store mask
         self._refresh_qoe_cache()
         obs = self._get_obs()
