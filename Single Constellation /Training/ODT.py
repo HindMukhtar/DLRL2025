@@ -579,13 +579,13 @@ class LEOEnv(gym.Env):
     Gymnasium environment wrapper for the LEO satellite handover simulation.
     """
 
-    def __init__(self, constellation_name, route, scenario=None):
+    def __init__(self, constellation_name, route, max_beams_per_step=64, scenario=None):
         super(LEOEnv, self).__init__()
         self.base_seed = int(os.getenv("EVAL_SEED", "42"))
         self.current_seed = self.base_seed
 
-        # We'll set a placeholder action space, but update it dynamically
-        self.action_space = spaces.Discrete(1)  # Will be updated in reset/step
+        self.max_beams_per_step = max_beams_per_step
+        self.action_space = spaces.Discrete(self.max_beams_per_step)
 
         # Observation space:
         low = np.array([-90, -180, 0, -100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
@@ -605,6 +605,7 @@ class LEOEnv(gym.Env):
         self.force_best_beam_on_first_step = True
 
         self.available_beams = []  # List of available beams for current step
+        self.current_beam_candidates = []  # Current step's beam candidates
         self.action_mask = None
         self.last_qoe = None
 
@@ -627,31 +628,33 @@ class LEOEnv(gym.Env):
         self.aircraft = self.earth.aircraft[0]  # Assume single aircraft for now
         self.current_step = 0
 
-        # Build global beam id list and mapping
-        self.all_beam_ids = []
-        self.beam_id_to_obj = {}
-        for plane in self.earth.LEO:
-            for sat in plane.sats:
-                for beam in sat.beams:
-                    self.all_beam_ids.append(beam.id)
-                    self.beam_id_to_obj[beam.id] = beam
-
-        self.action_space = spaces.Discrete(len(self.all_beam_ids))
-
         # Find available beams for the initial state
         self.available_beams = self._get_available_beams()
+        self._update_action_candidates()
 
     def _get_available_beams(self):
         # Returns a list of candidate beams (dicts) from scan_nearby_fast
         return self.aircraft.scan_nearby_fast(self.earth.LEO)
+
+    def _update_action_candidates(self):
+        """Update the current beam candidates (limited to max_beams_per_step)."""
+        all_candidates = self.available_beams
+
+        if all_candidates:
+            sorted_candidates = sorted(all_candidates, key=lambda x: x['snr'], reverse=True)
+            self.current_beam_candidates = sorted_candidates[:self.max_beams_per_step]
+        else:
+            self.current_beam_candidates = []
+
+        while len(self.current_beam_candidates) < self.max_beams_per_step:
+            self.current_beam_candidates.append(None)
     
     def _get_action_mask(self):
-        mask = np.zeros(len(self.all_beam_ids), dtype=bool)
-        available_ids = [b['beam'].id for b in self.available_beams]
-        for i, beam_id in enumerate(self.all_beam_ids):
-            if beam_id in available_ids:
+        mask = np.zeros(self.max_beams_per_step, dtype=bool)
+        for i, candidate in enumerate(self.current_beam_candidates):
+            if candidate is not None:
                 mask[i] = True
-        return mask    
+        return mask
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -663,15 +666,15 @@ class LEOEnv(gym.Env):
         self._refresh_qoe_cache()
         obs = self._get_obs()
         info = {
-            "available_beams": self.available_beams,
+            "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
             "action_mask": self.action_mask  # Return mask in info
         }
         return obs, info
 
     def step(self, action):
-        # Map action index to beam id
+        # Map action index to beam candidate
         print(f"Action received: {action}")
-        print(len(self.all_beam_ids))
+        print(f"Available beam candidates: {len([c for c in self.current_beam_candidates if c is not None])}")
         reward_penalty = 0
         self.handover_occurred = False
         if self.force_best_beam_on_first_step and self.current_step == 0:
@@ -689,27 +692,17 @@ class LEOEnv(gym.Env):
             if self.current_step >= len(self.route) - 1:
                 terminated = True
             info = {
-                "available_beams": self.available_beams,
+                "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
                 "action_mask": self.action_mask
             }
             self.current_step += 1
             return obs, final_reward, terminated, truncated, info
         
-        if 0 <= action < len(self.all_beam_ids):
-            beam_id = self.all_beam_ids[action]
-            available_ids = [b['beam'].id for b in self.available_beams]
-            
-            if beam_id in available_ids:
-                chosen = next(b for b in self.available_beams if b['beam'].id == beam_id)
-                self._apply_action_with_handover_constraints(chosen)
-            else:
-                print(f"Invalid action: beam {beam_id} not available")
-                self.aircraft.connected_beam = None 
-                self.aircraft.connected_satellite = None 
-                self.aircraft.current_snr = -100
-                reward_penalty = -1.0
+        if 0 <= action < self.max_beams_per_step and self.current_beam_candidates[action] is not None:
+            chosen = self.current_beam_candidates[action]
+            self._apply_action_with_handover_constraints(chosen)
         else:
-            print(f"Action {action} out of bounds")
+            print(f"Invalid action: {action}")
             self.aircraft.connected_beam = None 
             self.aircraft.connected_satellite = None 
             self.aircraft.current_snr = -100
@@ -724,6 +717,7 @@ class LEOEnv(gym.Env):
 
         # Update available beams for next step
         self.available_beams = self._get_available_beams()
+        self._update_action_candidates()
 
         # Update action mask for next step 
         self.action_mask = self._get_action_mask()
@@ -739,7 +733,7 @@ class LEOEnv(gym.Env):
             terminated = True
         
         info = {
-            "available_beams": self.available_beams,
+            "available_beams": len([c for c in self.current_beam_candidates if c is not None]),
             "action_mask": self.action_mask,  # Return mask in info
             "handover_occurred": self.handover_occurred
         }
@@ -799,7 +793,7 @@ class LEOEnv(gym.Env):
         # --- Combine throughput + latency ---
         w_thr = 0.7   # throughput weight
         w_lat = 0.3   # latency weight
-        w_drop = 0.2 # service drop weight
+        w_drop = 0.5 # service drop weight
 
         service_drop_s = qoe.get("service_drop_s", 0.0)
 

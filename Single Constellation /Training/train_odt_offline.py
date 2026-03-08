@@ -70,11 +70,11 @@ def main():
     models_dir = os.path.join(base_dir, MODELS_DIRNAME)
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
-    dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_merged.pkl")
+    dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_aug_multisim.pkl")
     if not os.path.exists(dataset_path):
-        dataset_path = os.path.join(base_dir, "odt_offline_dataset_merged.pkl")
-    output_path = os.path.join(models_dir, "decision_transformer_offline.pth")
-    best_path = os.path.join(models_dir, "decision_transformer_offline_best.pth")
+        dataset_path = os.path.join(base_dir, "odt_offline_dataset_aug_multisim.pkl")
+    output_path = os.path.join(models_dir, "decision_transformer_offline_v2.pth")
+    best_path = os.path.join(models_dir, "decision_transformer_offline_best_v2.pth")
     #resume_path = best_path if os.path.exists(best_path) else None
 
     resume_path = None 
@@ -93,8 +93,13 @@ def main():
         traj["rewards"] = np.clip(rewards, -5.0, 5.0)
 
     state_dim = trajectories[0]["states"].shape[1]
+    action_dim = int(os.getenv("ACTION_DIM", "64"))
     max_action = max(int(np.max(traj["actions"])) for traj in trajectories)
-    action_dim = max_action + 1
+    if max_action >= action_dim:
+        raise RuntimeError(
+            f"Dataset contains action index {max_action}, but ACTION_DIM={action_dim}. "
+            "Use a larger ACTION_DIM (e.g., 64 for PPO-style slots) or regenerate dataset with matching action space."
+        )
 
     np.random.seed(42)
     random.seed(42)

@@ -1,0 +1,22 @@
+{
+  "dataset_seeds": [
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50
+  ],
+  "scenarios": [
+    "load_cycle_1",
+    "load_cycle_2",
+    "load_cycle_5",
+    "large_aircraft",
+    "medium_aircraft",
+    "snr_congested"
+  ]
+}

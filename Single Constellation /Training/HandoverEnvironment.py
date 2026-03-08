@@ -297,7 +297,7 @@ class LEOEnv(gym.Env):
         # --- Combine throughput + latency ---
         w_thr = 0.7   # throughput weight
         w_lat = 0.3   # latency weight
-        w_drop = 0.2 # service drop weight
+        w_drop = 0.5 # service drop weight
 
         service_drop_s = qoe.get("service_drop_s", 0.0)
 

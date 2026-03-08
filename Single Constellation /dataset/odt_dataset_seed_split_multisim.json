@@ -1,0 +1,23 @@
+{
+  "dataset_seeds": [
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110
+  ],
+  "scenarios": [
+    "load_cycle_1",
+    "load_cycle_2",
+    "load_cycle_5",
+    "large_aircraft",
+    "medium_aircraft",
+    "snr_congested"
+  ],
+  "episodes_per_agent": 10
+}

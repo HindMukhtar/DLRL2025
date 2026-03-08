@@ -11,7 +11,6 @@ import pandas as pd
 import torch
 import math
 from sb3_contrib import MaskablePPO
-from stable_baselines3 import DQN
 from sb3_contrib.common.wrappers import ActionMasker
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +19,6 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 from Training.HandoverEnvironment import LEOEnv as PPOEnv, predict_valid_action
-from Training.HandoverEnvironment_DQN import LEOEnv as DQNEnv, predict_valid_action as predict_valid_action_dqn
 from Environment.LEOEnvironmentRL import load_route_from_csv
 
 DATASET_DIRNAME = "dataset"
@@ -168,7 +166,7 @@ def _oracle_action(env):
     # Match environment reward weights.
     w_thr = 0.7
     w_lat = 0.3
-    w_drop = 0.2
+    w_drop = 0.5
 
     best_action = -1
     best_reward = -float("inf")
@@ -243,7 +241,7 @@ def main():
     dataset_dir = SCRIPT_DIR
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(os.path.join(base_dir, MODELS_DIRNAME), exist_ok=True)
-    aug_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_aug_multisim.pkl")
+    aug_dataset_path = os.path.join(dataset_dir, "odt_offline_dataset_aug_multisim_v2.pkl")
     input_path = os.path.join(base_dir, "Inputs", "input.csv")
     if not os.path.exists(input_path):
         input_path = os.path.join(base_dir, "input.csv")
@@ -261,51 +259,43 @@ def main():
         "medium_aircraft",
         "snr_congested",
     ]
-    dataset_seeds = [41, 42, 43, 44, 45, 46, 47]
+    dataset_seeds = [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
 
-    # Per-scenario episode budgets by source.
-    # Target: ~50 episodes/scenario while keeping all scenarios represented.
-    # - load_cycle_1: PPO + oracle_latency + oracle_drop dominate
-    # - snr_congested: DQN dominates, oracle second
+    # Per-scenario episode budgets by source (equal samples per active agent).
+    # 4 active sources x 10 episodes = 40 episodes per scenario per seed.
     scenario_episode_budget = {
         "load_cycle_1": {
-            "ppo": 16,
-            "oracle_latency": 14,
-            "oracle_drop": 12,
-            "oracle": 6,
-            "dqn": 2,
+            "ppo": 10,
+            "oracle_latency": 10,
+            "oracle_drop": 10,
+            "oracle": 10,
         },
         "snr_congested": {
-            "dqn": 36,
-            "oracle": 3,
-            "oracle_drop": 8,
-            "oracle_latency": 1,
-            "ppo": 2,
+            "ppo": 10,
+            "oracle": 10,
+            "oracle_drop": 10,
+            "oracle_latency": 10,
         },
         "load_cycle_2": {
             "ppo": 10,
-            "dqn": 10,
             "oracle": 10,
             "oracle_latency": 10,
             "oracle_drop": 10,
         },
         "load_cycle_5": {
             "ppo": 10,
-            "dqn": 10,
             "oracle": 10,
             "oracle_latency": 10,
             "oracle_drop": 10,
         },
         "medium_aircraft": {
             "ppo": 10,
-            "dqn": 10,
             "oracle": 10,
             "oracle_latency": 10,
             "oracle_drop": 10,
         },
         "large_aircraft": {
             "ppo": 10,
-            "dqn": 10,
             "oracle": 10,
             "oracle_latency": 10,
             "oracle_drop": 10,
@@ -315,8 +305,6 @@ def main():
 
     ppo_model_path = _resolve_model_path(base_dir, "handover_ppo_agent")
     ppo_model = MaskablePPO.load(ppo_model_path, device="cpu")
-    dqn_model_path = _resolve_model_path(base_dir, "handover_dqn_agent")
-    dqn_model = DQN.load(dqn_model_path, device="cpu")
 
     for seed in dataset_seeds:
         print(f"\n========== DATASET SEED: {seed} ==========")
@@ -344,24 +332,6 @@ def main():
                         quiet=True,
                         scenario=scenario,
                         source="ppo",
-                        seed_base=seed * 10000,
-                    )
-                )
-
-            if episode_budget.get("dqn", 0) > 0:
-                print("DQN Agent Trajectories...")
-                dqn_env = DQNEnv(constellation_name, route, scenario=scenario)
-                dqn_env = ActionMasker(dqn_env, mask_fn)
-                dqn_env.env.earth.Training = True
-                trajectories.extend(
-                    _collect_trajectories(
-                        dqn_env,
-                        predict_valid_action_dqn,
-                        dqn_model,
-                        episode_budget.get("dqn", 0),
-                        quiet=True,
-                        scenario=scenario,
-                        source="dqn",
                         seed_base=seed * 10000,
                     )
                 )
@@ -423,7 +393,7 @@ def main():
     with open(aug_dataset_path, "wb") as f:
         pickle.dump(trajectories, f)
     print(f"Saved augmentation dataset with {len(trajectories)} trajectories to {aug_dataset_path}")
-    split_meta_path = os.path.join(dataset_dir, "odt_dataset_seed_split_multisim.json")
+    split_meta_path = os.path.join(dataset_dir, "odt_dataset_seed_split_multisim_v2.json")
     with open(split_meta_path, "w", encoding="utf-8") as f:
         json.dump(
             {

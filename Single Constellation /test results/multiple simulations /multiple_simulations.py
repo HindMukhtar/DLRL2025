@@ -22,10 +22,15 @@ def main():
     parser.add_argument(
         "--models",
         #default="PPO,DQN,BASELINE,ODT_FINETUNED",
-        default = "ODT_FINETUNED",
+        #default = "BASELINE",
+        default="ODT_FINETUNED",
         help="Comma-separated model labels used by testscript.",
     )
-    parser.add_argument("--scenario", default="load_cycle_1", help="Single scenario to evaluate.")
+    parser.add_argument(
+        "--scenarios",
+        default="load_cycle_1,load_cycle_2,load_cycle_3,medium_aircraft,large_aircraft,snr_congested",
+        help="Comma-separated scenarios to evaluate.",
+    )
     parser.add_argument(
         "--seeds",
         default="41,42,43,44,45,46,47,48,49,50",
@@ -46,20 +51,26 @@ def main():
     if not seeds:
         raise ValueError("No seeds provided. Pass --seeds with at least one seed.")
 
-    # For each simulation seed, run all models with the SAME seed.
+    scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+    # Scenario alias for compatibility with current env naming.
+    scenario_alias = {"load_cycle_3": "load_cycle_5"}
+    resolved_scenarios = [scenario_alias.get(s, s) for s in scenarios]
+
+    # For each simulation seed, run all models with the SAME seed across all scenarios.
     generated = []
     for sim_idx, seed in enumerate(seeds, start=1):
         run_tag = f"sim{sim_idx}"
-        for model in models:
-            _run_once(testscript_path, model, args.scenario, seed, run_tag)
-            out_csv = os.path.join(
-                test_results_dir, f"{model}_observations_{args.scenario}_{run_tag}.csv"
-            )
-            generated.append((model, seed, run_tag, out_csv))
+        for scenario in resolved_scenarios:
+            for model in models:
+                _run_once(testscript_path, model, scenario, seed, run_tag)
+                out_csv = os.path.join(
+                    test_results_dir, f"{model}_observations_{scenario}_{run_tag}.csv"
+                )
+                generated.append((model, scenario, seed, run_tag, out_csv))
 
     print("\nGenerated run files:")
-    for model, seed, run_tag, out_csv in generated:
-        print(f"- {model} | {run_tag} | seed={seed} | {out_csv}")
+    for model, scenario, seed, run_tag, out_csv in generated:
+        print(f"- {model} | {scenario} | {run_tag} | seed={seed} | {out_csv}")
 
 
 if __name__ == "__main__":

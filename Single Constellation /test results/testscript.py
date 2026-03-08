@@ -172,7 +172,7 @@ def predict_valid_action_oracle(base_env, obs, mask):
 
     w_thr = 0.7
     w_lat = 0.3
-    w_drop = 0.2
+    w_drop = 0.5
 
     best_action = -1
     best_reward = -float("inf")
